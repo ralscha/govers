@@ -1,0 +1,96 @@
+# https://taskfile.dev
+
+version: '3'
+
+vars:
+  MODULES: github.com/ralscha/govers/core/... github.com/ralscha/govers/inmemory/... github.com/ralscha/govers/mongodb/... github.com/ralscha/govers/postgres/...
+
+tasks:
+  default:
+    desc: List all available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build all modules
+    cmds:
+      - "go build {{.MODULES}}"
+
+  test:
+    desc: Run all tests
+    cmds:
+      - "go test {{.MODULES}}"
+
+  test:verbose:
+    desc: Run all tests with verbose output
+    cmds:
+      - "go test -v {{.MODULES}}"
+
+  test:coverage:
+    desc: Run tests with coverage report
+    cmds:
+      - "go test -coverprofile=coverage.out {{.MODULES}}"
+      - "go tool cover -html=coverage.out -o coverage.html"
+
+  test:race:
+    desc: Run tests with race detector
+    cmds:
+      - "go test -race {{.MODULES}}"
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - "go vet {{.MODULES}}"
+
+  fmt:
+    desc: Format all Go files
+    cmds:
+      - cmd: cd core && go fmt
+      - cmd: cd demo && go fmt
+      - cmd: cd inmemory && go fmt
+      - cmd: cd mongodb && go fmt
+      - cmd: cd postgres && go fmt
+
+  tidy:
+    desc: Tidy all module dependencies
+    cmds:
+      - cmd: cd core && go mod tidy
+      - cmd: cd demo && go mod tidy
+      - cmd: cd inmemory && go mod tidy
+      - cmd: cd mongodb && go mod tidy
+      - cmd: cd postgres && go mod tidy
+
+  verify:
+    desc: Verify dependencies
+    cmds:
+      - "go mod verify"
+
+  clean:
+    desc: Clean build artifacts and cache
+    cmds:
+      - "go clean -cache"
+      - cmd: del /f /q coverage.out coverage.html 2>nul
+        platforms: [windows]
+        ignore_error: true
+      - cmd: rm -f coverage.out coverage.html
+        platforms: [linux, darwin]
+        ignore_error: true
+
+  check:
+    desc: Run all checks (fmt, vet, test)
+    deps: [fmt, vet, test]
+
+  lint:
+    desc: Run golangci-lint in Docker
+    cmds:
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/core golangci/golangci-lint:v2.6.2 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demo golangci/golangci-lint:v2.6.2 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/inmemory golangci/golangci-lint:v2.6.2 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/mongodb golangci/golangci-lint:v2.6.2 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/postgres golangci/golangci-lint:v2.6.2 golangci-lint run -v --timeout 5m
+
+  ci:
+    desc: Run CI pipeline
+    cmds:
+      - task: vet
+      - task: test:race
