@@ -153,13 +153,7 @@ func TestUpdateCommit(t *testing.T) {
 		t.Errorf("Expected version 2, got %d", snapshot.Version)
 	}
 
-	salaryChanged := false
-	for _, prop := range snapshot.ChangedProperties {
-		if prop == testSalaryProperty {
-			salaryChanged = true
-			break
-		}
-	}
+	salaryChanged := slices.Contains(snapshot.ChangedProperties, testSalaryProperty)
 	if !salaryChanged {
 		t.Errorf("Expected 'salary' to be in changed properties, got %v", snapshot.ChangedProperties)
 	}
@@ -558,11 +552,8 @@ func TestQueryByChangedProperty(t *testing.T) {
 
 	found := false
 	for _, s := range snapshots {
-		for _, prop := range s.ChangedProperties {
-			if prop == testSalaryProperty {
-				found = true
-				break
-			}
+		if slices.Contains(s.ChangedProperties, testSalaryProperty) {
+			found = true
 		}
 	}
 	if !found {

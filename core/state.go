@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
+	"strings"
 )
 
 // SnapshotState represents the normalized state of a domain object as a property-value map.
@@ -40,12 +42,7 @@ func EmptySnapshotState() SnapshotState {
 
 // ShouldIgnoreOrder returns true if the property should ignore order when comparing slices.
 func (s SnapshotState) ShouldIgnoreOrder(propertyName string) bool {
-	for _, name := range s.ignoreOrderProperties {
-		if name == propertyName {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.ignoreOrderProperties, propertyName)
 }
 
 // Size returns the number of properties in the state.
@@ -363,15 +360,16 @@ func (s *SnapshotState) UnmarshalJSON(data []byte) error {
 // String returns a string representation of the state.
 func (s SnapshotState) String() string {
 	names := s.GetPropertyNames()
-	result := "{"
+	var result strings.Builder
+	result.WriteString("{")
 	for i, name := range names {
 		if i > 0 {
-			result += ", "
+			result.WriteString(", ")
 		}
-		result += fmt.Sprintf("%s:%v", name, s.properties[name])
+		result.WriteString(fmt.Sprintf("%s:%v", name, s.properties[name]))
 	}
-	result += "}"
-	return result
+	result.WriteString("}")
+	return result.String()
 }
 
 // SnapshotStateBuilder helps construct a SnapshotState incrementally.
@@ -390,10 +388,8 @@ func NewSnapshotStateBuilder() *SnapshotStateBuilder {
 
 // WithIgnoreOrderProperty marks a property to ignore element order when comparing slices.
 func (b *SnapshotStateBuilder) WithIgnoreOrderProperty(propertyName string) *SnapshotStateBuilder {
-	for _, name := range b.ignoreOrderProperties {
-		if name == propertyName {
-			return b
-		}
+	if slices.Contains(b.ignoreOrderProperties, propertyName) {
+		return b
 	}
 	b.ignoreOrderProperties = append(b.ignoreOrderProperties, propertyName)
 	return b

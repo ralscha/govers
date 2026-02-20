@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/ralscha/govers/core"
@@ -331,9 +332,7 @@ func (r *Repository) documentToSnapshot(doc SnapshotDocument) core.Snapshot {
 	var snapshotState core.SnapshotState
 	if len(doc.State.Properties) > 0 {
 		properties := make(map[string]any, len(doc.State.Properties))
-		for k, v := range doc.State.Properties {
-			properties[k] = v
-		}
+		maps.Copy(properties, doc.State.Properties)
 		snapshotState = core.NewSnapshotStateWithOptions(properties, doc.State.IgnoreOrderProperties)
 	} else {
 		snapshotState = core.EmptySnapshotState()

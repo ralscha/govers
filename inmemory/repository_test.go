@@ -410,13 +410,7 @@ func TestEntityTagChangeDetection(t *testing.T) {
 
 	snapshot := commit.Snapshots[0]
 
-	found := false
-	for _, prop := range snapshot.ChangedProperties {
-		if prop == "address" {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(snapshot.ChangedProperties, "address")
 	if !found {
 		t.Errorf("Expected 'address' in changed properties, got %v", snapshot.ChangedProperties)
 	}
@@ -481,13 +475,7 @@ func TestIgnoreOrderTagWithDifferentElements(t *testing.T) {
 
 	snapshot := commit.Snapshots[0]
 
-	found := false
-	for _, prop := range snapshot.ChangedProperties {
-		if prop == "tags" {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(snapshot.ChangedProperties, "tags")
 	if !found {
 		t.Errorf("Expected 'tags' in changed properties, got %v", snapshot.ChangedProperties)
 	}
