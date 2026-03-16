@@ -83,11 +83,11 @@ tasks:
   lint:
     desc: Run golangci-lint in Docker
     cmds:
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/core golangci/golangci-lint:v2.9.0 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demo golangci/golangci-lint:v2.9.0 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/inmemory golangci/golangci-lint:v2.9.0 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/mongodb golangci/golangci-lint:v2.9.0 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/postgres golangci/golangci-lint:v2.9.0 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/core golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demo golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/inmemory golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/mongodb golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/postgres golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
 
   ci:
     desc: Run CI pipeline
