@@ -42,14 +42,14 @@ tasks:
     cmds:
       - "go vet {{.MODULES}}"
 
-  fmt:
+  format:
     desc: Format all Go files
     cmds:
-      - cmd: cd core && go fmt
-      - cmd: cd demo && go fmt
-      - cmd: cd inmemory && go fmt
-      - cmd: cd mongodb && go fmt
-      - cmd: cd postgres && go fmt
+      - cmd: cd core && go fix && go fmt
+      - cmd: cd demo && go fix && go fmt
+      - cmd: cd inmemory && go fix && go fmt
+      - cmd: cd mongodb && go fix && go fmt
+      - cmd: cd postgres && go fix && go fmt
 
   tidy:
     desc: Tidy all module dependencies
@@ -83,11 +83,11 @@ tasks:
   lint:
     desc: Run golangci-lint in Docker
     cmds:
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/core golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demo golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/inmemory golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/mongodb golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
-      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/postgres golangci/golangci-lint:v2.11.3 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/core golangci/golangci-lint:v2.11.4 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/demo golangci/golangci-lint:v2.11.4 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/inmemory golangci/golangci-lint:v2.11.4 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/mongodb golangci/golangci-lint:v2.11.4 golangci-lint run -v --timeout 5m
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app/postgres golangci/golangci-lint:v2.11.4 golangci-lint run -v --timeout 5m
 
   ci:
     desc: Run CI pipeline

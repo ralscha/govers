@@ -3,7 +3,7 @@ module github.com/ralscha/govers/postgres
 go 1.26.1
 
 require (
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.1
 	github.com/ralscha/govers/core v0.0.0
 	github.com/testcontainers/testcontainers-go v0.34.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.34.0
