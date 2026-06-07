@@ -1,7 +1,7 @@
 // Package mongodb provides a MongoDB implementation of the govers Repository interface.
 // It uses the official MongoDB Go driver and stores snapshots in MongoDB collections.
 // The schema is inspired by JaVers and uses 2 collections:
-//   - gv_head_id — one document with the last CommitId
+//   - gv_head_id: one document with the last CommitID
 //   - gv_snapshots — domain object snapshots with embedded commit metadata
 package mongodb
 
@@ -64,7 +64,7 @@ type CommitPropertyDocument struct {
 
 // CommitMetadataDocument represents the commitMetadata subdocument.
 type CommitMetadataDocument struct {
-	ID         float64                  `bson:"id"`
+	ID         string                   `bson:"id"`
 	Author     string                   `bson:"author"`
 	CommitDate time.Time                `bson:"commitDate"`
 	Properties []CommitPropertyDocument `bson:"properties,omitempty"`
@@ -197,16 +197,6 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
-func commitIDToFloat(id core.CommitID) float64 {
-	return float64(id.MajorID) + float64(id.MinorID)/100.0
-}
-
-func floatToCommitID(f float64) core.CommitID {
-	majorID := int64(f)
-	minorID := int((f - float64(majorID)) * 100)
-	return core.CommitID{MajorID: majorID, MinorID: minorID}
-}
-
 // GetHeadID returns the latest CommitID, or zero CommitID if no commits exist.
 func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 	var headDoc HeadIDDocument
@@ -218,14 +208,12 @@ func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 		return core.CommitID{}, fmt.Errorf("failed to get head id: %w", err)
 	}
 
-	var majorID int64
-	var minorID int
-	_, err = fmt.Sscanf(headDoc.ID, "%d.%d", &majorID, &minorID)
+	headID, err := core.ParseCommitID(headDoc.ID)
 	if err != nil {
 		return core.CommitID{}, fmt.Errorf("failed to parse head id: %w", err)
 	}
 
-	return core.CommitID{MajorID: majorID, MinorID: minorID}, nil
+	return headID, nil
 }
 
 // Persist saves a commit and its snapshots to the repository.
@@ -280,7 +268,7 @@ func (r *Repository) snapshotToDocument(snapshot core.Snapshot) SnapshotDocument
 		Type:              string(snapshot.Type),
 		Version:           snapshot.Version,
 		CommitMetadata: CommitMetadataDocument{
-			ID:         commitIDToFloat(snapshot.CommitMetadata.ID),
+			ID:         snapshot.CommitMetadata.ID.String(),
 			Author:     snapshot.CommitMetadata.Author,
 			CommitDate: snapshot.CommitMetadata.CommitDate,
 		},
@@ -314,7 +302,7 @@ func (r *Repository) snapshotToDocument(snapshot core.Snapshot) SnapshotDocument
 	return doc
 }
 
-func (r *Repository) documentToSnapshot(doc SnapshotDocument) core.Snapshot {
+func (r *Repository) documentToSnapshot(doc SnapshotDocument) (core.Snapshot, error) {
 	var globalID core.GlobalID
 	if doc.GlobalID.Entity != "" {
 		globalID = core.NewInstanceID(doc.GlobalID.Entity, doc.GlobalID.CdoID)
@@ -338,6 +326,11 @@ func (r *Repository) documentToSnapshot(doc SnapshotDocument) core.Snapshot {
 		snapshotState = core.EmptySnapshotState()
 	}
 
+	commitID, err := core.ParseCommitID(doc.CommitMetadata.ID)
+	if err != nil {
+		return core.Snapshot{}, fmt.Errorf("failed to parse commit id: %w", err)
+	}
+
 	return core.Snapshot{
 		GlobalID:          globalID,
 		State:             snapshotState,
@@ -345,12 +338,12 @@ func (r *Repository) documentToSnapshot(doc SnapshotDocument) core.Snapshot {
 		Type:              core.SnapshotType(doc.Type),
 		Version:           doc.Version,
 		CommitMetadata: core.CommitMetadata{
-			ID:         floatToCommitID(doc.CommitMetadata.ID),
+			ID:         commitID,
 			Author:     doc.CommitMetadata.Author,
 			CommitDate: doc.CommitMetadata.CommitDate,
 			Properties: properties,
 		},
-	}
+	}, nil
 }
 
 // GetLatestSnapshot returns the most recent snapshot for the given GlobalID.
@@ -368,7 +361,10 @@ func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.Global
 		return nil, fmt.Errorf("failed to get latest snapshot: %w", err)
 	}
 
-	snapshot := r.documentToSnapshot(doc)
+	snapshot, err := r.documentToSnapshot(doc)
+	if err != nil {
+		return nil, err
+	}
 	return &snapshot, nil
 }
 
@@ -402,14 +398,7 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 	}
 
 	if !query.CommitID.IsZero() {
-		commitIDFloat := commitIDToFloat(query.CommitID)
-		filter = append(filter, bson.E{
-			Key: fieldCommitID,
-			Value: bson.D{
-				{Key: "$gte", Value: commitIDFloat - 0.005},
-				{Key: "$lte", Value: commitIDFloat + 0.005},
-			},
-		})
+		filter = append(filter, bson.E{Key: fieldCommitID, Value: query.CommitID.String()})
 	}
 
 	if !query.FromDate.IsZero() {
@@ -448,7 +437,10 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("failed to decode snapshot: %w", err)
 		}
-		snapshot := r.documentToSnapshot(doc)
+		snapshot, err := r.documentToSnapshot(doc)
+		if err != nil {
+			return nil, err
+		}
 		snapshots = append(snapshots, snapshot)
 	}
 
@@ -476,7 +468,10 @@ func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, ve
 		return nil, fmt.Errorf("failed to get snapshot: %w", err)
 	}
 
-	snapshot := r.documentToSnapshot(doc)
+	snapshot, err := r.documentToSnapshot(doc)
+	if err != nil {
+		return nil, err
+	}
 	return &snapshot, nil
 }
 

@@ -3,6 +3,8 @@ package core
 import (
 	"fmt"
 	"maps"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -29,6 +31,26 @@ type CommitID struct {
 // String returns the string representation of the CommitID: "major.minor"
 func (c CommitID) String() string {
 	return fmt.Sprintf("%d.%d", c.MajorID, c.MinorID)
+}
+
+// ParseCommitID parses a CommitID string in "major.minor" format.
+func ParseCommitID(s string) (CommitID, error) {
+	major, minor, ok := strings.Cut(s, ".")
+	if !ok {
+		return CommitID{}, fmt.Errorf("invalid commit ID %q", s)
+	}
+
+	majorID, err := strconv.ParseInt(major, 10, 64)
+	if err != nil {
+		return CommitID{}, fmt.Errorf("invalid commit ID major part %q: %w", major, err)
+	}
+
+	minorID, err := strconv.Atoi(minor)
+	if err != nil {
+		return CommitID{}, fmt.Errorf("invalid commit ID minor part %q: %w", minor, err)
+	}
+
+	return CommitID{MajorID: majorID, MinorID: minorID}, nil
 }
 
 // IsZero returns true if this is the zero value CommitID.

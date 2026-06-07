@@ -1,9 +1,9 @@
 module github.com/ralscha/govers/postgres
 
-go 1.26.3
+go 1.26.4
 
 require (
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/ralscha/govers/core v0.0.0
 	github.com/testcontainers/testcontainers-go v0.34.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.34.0

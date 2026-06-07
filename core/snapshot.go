@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 // Tag constants for struct field annotations.
@@ -122,8 +123,7 @@ func (f *SnapshotFactory) extractIDValue(v reflect.Value) (any, error) {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		tag := field.Tag.Get(TagName)
-		if tag == TagID {
+		if hasGoversTag(field.Tag.Get(TagName), TagID) {
 			fieldValue := v.Field(i)
 			if !fieldValue.CanInterface() {
 				continue
@@ -154,14 +154,13 @@ func (f *SnapshotFactory) extractStateFromValue(v reflect.Value) (SnapshotState,
 		}
 
 		tag := field.Tag.Get(TagName)
-		if tag == TagIgnore {
+		if hasGoversTag(tag, TagIgnore) {
 			continue
 		}
 
 		fieldName := f.getFieldName(field)
 
-		// Check if field has ignoreOrder tag
-		if tag == TagIgnoreOrder {
+		if hasGoversTag(tag, TagIgnoreOrder) {
 			builder.WithIgnoreOrderProperty(fieldName)
 		}
 
@@ -193,7 +192,7 @@ func (f *SnapshotFactory) extractValue(v reflect.Value, tag string) any {
 		v = v.Elem()
 	}
 
-	if tag == TagEntity && v.Kind() == reflect.Struct {
+	if hasGoversTag(tag, TagEntity) && v.Kind() == reflect.Struct {
 		if id, err := f.extractIDValue(v); err == nil {
 			typeName := v.Type().Name()
 			return NewInstanceID(typeName, id).Value()
@@ -205,6 +204,15 @@ func (f *SnapshotFactory) extractValue(v reflect.Value, tag string) any {
 	}
 
 	return nil
+}
+
+func hasGoversTag(tag, option string) bool {
+	for part := range strings.SplitSeq(tag, ",") {
+		if strings.TrimSpace(part) == option {
+			return true
+		}
+	}
+	return false
 }
 
 // CompareStates compares two SnapshotStates and returns the list of changed property names.

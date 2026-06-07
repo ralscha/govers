@@ -22,6 +22,8 @@ type Employee struct {
 }
 
 func setupTestContainer(t *testing.T) (*mongodb.Repository, func()) {
+	skipIfTestcontainersUnavailable(t)
+
 	ctx := context.Background()
 
 	container, err := tcmongodb.Run(ctx,
@@ -58,6 +60,16 @@ func setupTestContainer(t *testing.T) (*mongodb.Repository, func()) {
 	}
 
 	return repo, cleanup
+}
+
+func skipIfTestcontainersUnavailable(t *testing.T) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Skipf("Testcontainers provider is not available: %v", r)
+		}
+	}()
+	testcontainers.SkipIfProviderIsNotHealthy(t)
 }
 
 func TestBasicCommit(t *testing.T) {
@@ -610,6 +622,8 @@ func TestQueryWithSkip(t *testing.T) {
 }
 
 func TestCustomCollectionNames(t *testing.T) {
+	skipIfTestcontainersUnavailable(t)
+
 	ctx := context.Background()
 
 	container, err := tcmongodb.Run(ctx,

@@ -366,7 +366,7 @@ func (s SnapshotState) String() string {
 		if i > 0 {
 			result.WriteString(", ")
 		}
-		result.WriteString(fmt.Sprintf("%s:%v", name, s.properties[name]))
+		fmt.Fprintf(&result, "%s:%v", name, s.properties[name])
 	}
 	result.WriteString("}")
 	return result.String()

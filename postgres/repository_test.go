@@ -21,6 +21,8 @@ type Employee struct {
 }
 
 func setupTestContainer(t *testing.T) (*postgres.Repository, func()) {
+	skipIfTestcontainersUnavailable(t)
+
 	ctx := context.Background()
 
 	container, err := tcpostgres.Run(ctx,
@@ -61,6 +63,16 @@ func setupTestContainer(t *testing.T) (*postgres.Repository, func()) {
 	}
 
 	return repo, cleanup
+}
+
+func skipIfTestcontainersUnavailable(t *testing.T) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Skipf("Testcontainers provider is not available: %v", r)
+		}
+	}()
+	testcontainers.SkipIfProviderIsNotHealthy(t)
 }
 
 func TestBasicCommit(t *testing.T) {

@@ -107,22 +107,23 @@ func (r *Repository) CreateSchema(ctx context.Context) error {
 	return nil
 }
 
-func commitIDToDecimal(id core.CommitID) float64 {
-	return float64(id.MajorID) + float64(id.MinorID)/100.0
+func commitIDToDecimal(id core.CommitID) string {
+	return fmt.Sprintf("%d.%02d", id.MajorID, id.MinorID)
 }
 
-func decimalToCommitID(decimal float64) core.CommitID {
-	majorID := int64(decimal)
-	minorID := int((decimal - float64(majorID)) * 100)
-	return core.CommitID{MajorID: majorID, MinorID: minorID}
+func decimalToCommitID(decimal string) (core.CommitID, error) {
+	if !strings.Contains(decimal, ".") {
+		decimal += ".0"
+	}
+	return core.ParseCommitID(decimal)
 }
 
 // GetHeadID returns the latest CommitID, or zero CommitID if no commits exist.
 func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
-	var commitIDDecimal float64
+	var commitIDDecimal string
 
 	err := r.pool.QueryRow(ctx, `
-		SELECT commit_id 
+		SELECT commit_id::text
 		FROM gv_commit 
 		ORDER BY commit_id DESC 
 		LIMIT 1
@@ -135,7 +136,12 @@ func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 		return core.CommitID{}, fmt.Errorf("failed to get head id: %w", err)
 	}
 
-	return decimalToCommitID(commitIDDecimal), nil
+	commitID, err := decimalToCommitID(commitIDDecimal)
+	if err != nil {
+		return core.CommitID{}, fmt.Errorf("failed to parse head id: %w", err)
+	}
+
+	return commitID, nil
 }
 
 func (r *Repository) getOrCreateGlobalID(ctx context.Context, tx pgx.Tx, globalID core.GlobalID) (int64, error) {
@@ -279,7 +285,7 @@ func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.Global
 	row := r.pool.QueryRow(ctx, fmt.Sprintf(`
 		SELECT g.local_id, g.type_name, g.fragment, g.owner_id_fk,
 		       s.state, s.changed_properties, s.type, s.version,
-		       c.commit_id, c.author, c.commit_date
+		       c.commit_id::text, c.author, c.commit_date
 		FROM gv_snapshot s
 		JOIN gv_global_id g ON s.global_id_fk = g.global_id_pk
 		JOIN gv_commit c ON s.commit_fk = c.commit_pk
@@ -365,7 +371,7 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 	sql := fmt.Sprintf(`
 		SELECT g.local_id, g.type_name, g.fragment, g.owner_id_fk,
 		       s.state, s.changed_properties, s.type, s.version,
-		       c.commit_id, c.author, c.commit_date
+		       c.commit_id::text, c.author, c.commit_date
 		FROM gv_snapshot s
 		JOIN gv_global_id g ON s.global_id_fk = g.global_id_pk
 		JOIN gv_commit c ON s.commit_fk = c.commit_pk
@@ -421,7 +427,7 @@ func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, ve
 	sql := fmt.Sprintf(`
 		SELECT g.local_id, g.type_name, g.fragment, g.owner_id_fk,
 		       s.state, s.changed_properties, s.type, s.version,
-		       c.commit_id, c.author, c.commit_date
+		       c.commit_id::text, c.author, c.commit_date
 		FROM gv_snapshot s
 		JOIN gv_global_id g ON s.global_id_fk = g.global_id_pk
 		JOIN gv_commit c ON s.commit_fk = c.commit_pk
@@ -448,7 +454,7 @@ func (r *Repository) scanSnapshot(ctx context.Context, row pgx.Row) (*core.Snaps
 	var state, changedPropsJSON []byte
 	var snapshotType string
 	var version int64
-	var commitIDDecimal float64
+	var commitIDDecimal string
 	var author string
 	var commitDate time.Time
 
@@ -470,7 +476,7 @@ func (r *Repository) scanSnapshotFromRows(ctx context.Context, rows pgx.Rows) (*
 	var state, changedPropsJSON []byte
 	var snapshotType string
 	var version int64
-	var commitIDDecimal float64
+	var commitIDDecimal string
 	var author string
 	var commitDate time.Time
 
@@ -487,7 +493,7 @@ func (r *Repository) scanSnapshotFromRows(ctx context.Context, rows pgx.Rows) (*
 
 func (r *Repository) buildSnapshot(ctx context.Context, localID, typeName string, fragment *string, ownerIDFk *int64,
 	state, changedPropsJSON []byte, snapshotType string, version int64,
-	commitIDDecimal float64, author string, commitDate time.Time) (*core.Snapshot, error) {
+	commitIDDecimal string, author string, commitDate time.Time) (*core.Snapshot, error) {
 	var changedProperties []string
 	if len(changedPropsJSON) > 0 {
 		if err := json.Unmarshal(changedPropsJSON, &changedProperties); err != nil {
@@ -504,7 +510,10 @@ func (r *Repository) buildSnapshot(ctx context.Context, localID, typeName string
 		snapshotState = core.EmptySnapshotState()
 	}
 
-	commitID := decimalToCommitID(commitIDDecimal)
+	commitID, err := decimalToCommitID(commitIDDecimal)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse commit id: %w", err)
+	}
 	properties, err := r.loadCommitProperties(ctx, commitIDDecimal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load commit properties: %w", err)
@@ -539,7 +548,7 @@ func (r *Repository) buildSnapshot(ctx context.Context, localID, typeName string
 	return &snapshot, nil
 }
 
-func (r *Repository) loadCommitProperties(ctx context.Context, commitIDDecimal float64) (map[string]string, error) {
+func (r *Repository) loadCommitProperties(ctx context.Context, commitIDDecimal string) (map[string]string, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT p.property_name, p.property_value
 		FROM gv_commit_property p

@@ -40,6 +40,14 @@ type PersonWithMultipleTags struct {
 	Tags         []string `govers:"ignoreOrder" json:"tags"`
 }
 
+type PersonWithCombinedTags struct {
+	ID      int      `govers:"id,primary"`
+	Name    string   `json:"name"`
+	Address *Address `govers:"entity,nullable" json:"address"`
+	Tags    []string `govers:"ignoreOrder,set" json:"tags"`
+	Secret  string   `govers:"ignore,audit" json:"secret"`
+}
+
 func TestIgnoreTag(t *testing.T) {
 	factory := NewSnapshotFactory()
 
@@ -366,6 +374,42 @@ func TestMultipleTagsOnEntity(t *testing.T) {
 	}
 }
 
+func TestCombinedGoversTags(t *testing.T) {
+	factory := NewSnapshotFactory()
+
+	address := &Address{ID: 100, Street: "123 Main St", City: "Boston"}
+	person := PersonWithCombinedTags{
+		ID:      1,
+		Name:    testPersonName,
+		Address: address,
+		Tags:    []string{"go", "backend"},
+		Secret:  "hidden",
+	}
+
+	globalID, err := factory.ExtractGlobalID(person)
+	if err != nil {
+		t.Fatalf("Failed to extract global ID: %v", err)
+	}
+	if globalID.Value() != "PersonWithCombinedTags/1" {
+		t.Fatalf("Expected combined id tag to be honored, got %s", globalID.Value())
+	}
+
+	state, err := factory.ExtractState(person)
+	if err != nil {
+		t.Fatalf("Failed to extract state: %v", err)
+	}
+
+	if state.GetPropertyValue("secret") != nil {
+		t.Error("Expected combined ignore tag to omit secret")
+	}
+	if state.GetPropertyValue("address") != NewInstanceID("Address", 100).Value() {
+		t.Errorf("Expected combined entity tag to dehydrate address, got %v", state.GetPropertyValue("address"))
+	}
+	if !state.ShouldIgnoreOrder("tags") {
+		t.Error("Expected combined ignoreOrder tag to be honored")
+	}
+}
+
 func TestNumericComparison(t *testing.T) {
 	state1 := NewSnapshotState(map[string]any{
 		"salary": 50000,
@@ -386,6 +430,20 @@ func TestNumericComparison(t *testing.T) {
 	changedProps := CompareStates(state1, state2)
 	if len(changedProps) != 0 {
 		t.Errorf("Expected no changed properties, got %v", changedProps)
+	}
+}
+
+func TestParseCommitID(t *testing.T) {
+	commitID, err := ParseCommitID("12.10")
+	if err != nil {
+		t.Fatalf("ParseCommitID failed: %v", err)
+	}
+	if commitID != (CommitID{MajorID: 12, MinorID: 10}) {
+		t.Fatalf("Expected 12.10, got %v", commitID)
+	}
+
+	if _, err := ParseCommitID("12"); err == nil {
+		t.Fatal("Expected invalid commit ID to return an error")
 	}
 }
 
