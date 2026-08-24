@@ -1,6 +1,6 @@
 module github.com/ralscha/govers/demo
 
-go 1.26.6
+go 1.27.0
 
 require (
 	github.com/ralscha/govers/core v0.0.0

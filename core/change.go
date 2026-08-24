@@ -61,10 +61,8 @@ func (c NewObjectCreated) isChange() {}
 // NewNewObjectCreated creates a NewObjectCreated change.
 func NewNewObjectCreated(globalID GlobalID, metadata CommitMetadata) NewObjectCreated {
 	return NewObjectCreated{
-		baseChange: baseChange{
-			globalID:       globalID,
-			commitMetadata: metadata,
-		},
+		globalID:       globalID,
+		commitMetadata: metadata,
 	}
 }
 
@@ -83,10 +81,8 @@ func (c ObjectRemoved) isChange() {}
 // NewObjectRemoved creates an ObjectRemoved change.
 func NewObjectRemoved(globalID GlobalID, metadata CommitMetadata) ObjectRemoved {
 	return ObjectRemoved{
-		baseChange: baseChange{
-			globalID:       globalID,
-			commitMetadata: metadata,
-		},
+		globalID:       globalID,
+		commitMetadata: metadata,
 	}
 }
 
@@ -108,13 +104,11 @@ func (c ValueChange) isChange() {}
 // NewValueChange creates a ValueChange.
 func NewValueChange(globalID GlobalID, metadata CommitMetadata, propertyName string, left, right any) ValueChange {
 	return ValueChange{
-		baseChange: baseChange{
-			globalID:       globalID,
-			commitMetadata: metadata,
-		},
-		PropertyName: propertyName,
-		Left:         left,
-		Right:        right,
+		globalID:       globalID,
+		commitMetadata: metadata,
+		PropertyName:   propertyName,
+		Left:           left,
+		Right:          right,
 	}
 }
 
@@ -136,13 +130,11 @@ func (c ReferenceChange) isChange() {}
 // NewReferenceChange creates a ReferenceChange.
 func NewReferenceChange(globalID GlobalID, metadata CommitMetadata, propertyName string, left, right GlobalID) ReferenceChange {
 	return ReferenceChange{
-		baseChange: baseChange{
-			globalID:       globalID,
-			commitMetadata: metadata,
-		},
-		PropertyName: propertyName,
-		Left:         left,
-		Right:        right,
+		globalID:       globalID,
+		commitMetadata: metadata,
+		PropertyName:   propertyName,
+		Left:           left,
+		Right:          right,
 	}
 }
 
@@ -170,10 +162,8 @@ func (c ListChange) isChange() {}
 // NewListChange creates a ListChange.
 func NewListChange(globalID GlobalID, metadata CommitMetadata, propertyName string, elementChanges []ElementChange) ListChange {
 	return ListChange{
-		baseChange: baseChange{
-			globalID:       globalID,
-			commitMetadata: metadata,
-		},
+		globalID:       globalID,
+		commitMetadata: metadata,
 		PropertyName:   propertyName,
 		ElementChanges: elementChanges,
 	}
@@ -204,12 +194,10 @@ func (c MapChange) isChange() {}
 // NewMapChange creates a MapChange.
 func NewMapChange(globalID GlobalID, metadata CommitMetadata, propertyName string, entryChanges []EntryChange) MapChange {
 	return MapChange{
-		baseChange: baseChange{
-			globalID:       globalID,
-			commitMetadata: metadata,
-		},
-		PropertyName: propertyName,
-		EntryChanges: entryChanges,
+		globalID:       globalID,
+		commitMetadata: metadata,
+		PropertyName:   propertyName,
+		EntryChanges:   entryChanges,
 	}
 }
 
