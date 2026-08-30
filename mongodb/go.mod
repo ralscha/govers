@@ -6,7 +6,7 @@ require (
 	github.com/ralscha/govers/core v0.0.0
 	github.com/testcontainers/testcontainers-go v0.34.0
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.34.0
-	go.mongodb.org/mongo-driver/v2 v2.8.0
+	go.mongodb.org/mongo-driver/v2 v2.8.2
 )
 
 require (
