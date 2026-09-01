@@ -21,6 +21,7 @@ import (
 const (
 	defaultSnapshotsCollectionName = "gv_snapshots"
 	defaultHeadIDCollectionName    = "gv_head_id"
+	headDocumentKey                = "govers-head"
 
 	// Field names for snapshots
 	fieldGlobalIDKey           = "globalId_key"
@@ -74,6 +75,7 @@ type CommitMetadataDocument struct {
 type StateDocument struct {
 	Properties            bson.M   `bson:"properties"`
 	IgnoreOrderProperties []string `bson:"ignoreOrderProperties,omitempty"`
+	EntityProperties      []string `bson:"entityProperties,omitempty"`
 }
 
 // SnapshotDocument represents a snapshot document in MongoDB.
@@ -138,6 +140,7 @@ func NewWithConnString(ctx context.Context, connString, databaseName string, opt
 	}
 
 	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
 	}
 
@@ -175,6 +178,10 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 
 	indexes := []mongo.IndexModel{
 		{Keys: bson.D{{Key: fieldGlobalIDKey, Value: 1}}},
+		{
+			Keys:    bson.D{{Key: fieldGlobalIDKey, Value: 1}, {Key: fieldVersion, Value: 1}},
+			Options: options.Index().SetUnique(true),
+		},
 		{Keys: bson.D{{Key: fieldGlobalIDEntity, Value: 1}}},
 		{Keys: bson.D{{Key: fieldGlobalIDValueObject, Value: 1}}},
 		{Keys: bson.D{{Key: fieldGlobalIDOwnerIDEntity, Value: 1}}},
@@ -194,13 +201,17 @@ func (r *Repository) EnsureSchema(ctx context.Context) error {
 		return fmt.Errorf("failed to create indexes: %w", err)
 	}
 
-	return nil
+	return r.ensureCanonicalHead(ctx)
 }
 
 // GetHeadID returns the latest CommitID, or zero CommitID if no commits exist.
 func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 	var headDoc HeadIDDocument
-	err := r.headIDCollection().FindOne(ctx, bson.D{}).Decode(&headDoc)
+	err := r.headIDCollection().FindOne(ctx, bson.D{{Key: "_id", Value: headDocumentKey}}).Decode(&headDoc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		// Compatibility with repositories created before the canonical head key.
+		err = r.headIDCollection().FindOne(ctx, bson.D{}).Decode(&headDoc)
+	}
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return core.CommitID{}, nil
 	}
@@ -218,30 +229,96 @@ func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 
 // Persist saves a commit and its snapshots to the repository.
 func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
-	for _, snapshot := range commit.Snapshots {
-		doc := r.snapshotToDocument(snapshot)
-		_, err := r.snapshotsCollection().InsertOne(ctx, doc)
-		if err != nil {
-			return fmt.Errorf("failed to insert snapshot: %w", err)
-		}
+	if err := r.ensureCanonicalHead(ctx); err != nil {
+		return err
+	}
+	headID, err := r.GetHeadID(ctx)
+	if err != nil {
+		return err
+	}
+	expectedID := headID.Next()
+	if commit.Metadata.ID != expectedID {
+		return fmt.Errorf("%w: expected commit ID %s, got %s", core.ErrConcurrentCommit, expectedID, commit.Metadata.ID)
 	}
 
-	if err := r.updateHeadID(ctx, commit.Metadata.ID); err != nil {
-		return fmt.Errorf("failed to update head id: %w", err)
+	insertedIDs := make([]any, 0, len(commit.Snapshots))
+	for _, snapshot := range commit.Snapshots {
+		doc := r.snapshotToDocument(snapshot)
+		result, err := r.snapshotsCollection().InsertOne(ctx, doc)
+		if err != nil {
+			persistErr := fmt.Errorf("failed to insert snapshot: %w", err)
+			if mongo.IsDuplicateKeyError(err) {
+				persistErr = fmt.Errorf("%w: snapshot version already exists: %v", core.ErrConcurrentCommit, err)
+			}
+			return errors.Join(persistErr, r.removeSnapshots(ctx, insertedIDs))
+		}
+		insertedIDs = append(insertedIDs, result.InsertedID)
+	}
+
+	if err := r.advanceHeadID(ctx, headID, commit.Metadata.ID); err != nil {
+		return errors.Join(err, r.removeSnapshots(ctx, insertedIDs))
 	}
 
 	return nil
 }
 
-func (r *Repository) updateHeadID(ctx context.Context, commitID core.CommitID) error {
-	headDoc := HeadIDDocument{ID: commitID.String()}
-	opts := options.Replace().SetUpsert(true)
-
-	_, err := r.headIDCollection().ReplaceOne(ctx, bson.D{}, headDoc, opts)
+func (r *Repository) advanceHeadID(ctx context.Context, previousID, commitID core.CommitID) error {
+	filter := bson.D{
+		{Key: "_id", Value: headDocumentKey},
+		{Key: "id", Value: previousID.String()},
+	}
+	update := bson.D{{Key: "$set", Value: bson.D{{Key: "id", Value: commitID.String()}}}}
+	result, err := r.headIDCollection().UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("failed to update head id: %w", err)
 	}
+	if result.MatchedCount != 1 {
+		return fmt.Errorf("%w: repository head advanced after commit ID %s was selected", core.ErrConcurrentCommit, commitID)
+	}
 
+	return nil
+}
+
+func (r *Repository) ensureCanonicalHead(ctx context.Context) error {
+	var canonical HeadIDDocument
+	err := r.headIDCollection().FindOne(ctx, bson.D{{Key: "_id", Value: headDocumentKey}}).Decode(&canonical)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		return fmt.Errorf("failed to inspect head id: %w", err)
+	}
+
+	initialID := core.CommitID{}.String()
+	var legacy HeadIDDocument
+	err = r.headIDCollection().FindOne(ctx, bson.D{}).Decode(&legacy)
+	if err == nil {
+		initialID = legacy.ID
+	} else if !errors.Is(err, mongo.ErrNoDocuments) {
+		return fmt.Errorf("failed to inspect legacy head id: %w", err)
+	}
+
+	_, err = r.headIDCollection().InsertOne(ctx, bson.D{
+		{Key: "_id", Value: headDocumentKey},
+		{Key: "id", Value: initialID},
+	})
+	if err != nil && !mongo.IsDuplicateKeyError(err) {
+		return fmt.Errorf("failed to initialize head id: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) removeSnapshots(ctx context.Context, ids []any) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := r.snapshotsCollection().DeleteMany(ctx, bson.D{{
+		Key:   "_id",
+		Value: bson.D{{Key: "$in", Value: ids}},
+	}})
+	if err != nil {
+		return fmt.Errorf("failed to roll back snapshots: %w", err)
+	}
 	return nil
 }
 
@@ -251,18 +328,12 @@ func (r *Repository) snapshotToDocument(snapshot core.Snapshot) SnapshotDocument
 		properties[name] = value
 	})
 
-	var ignoreOrderProperties []string
-	for _, name := range snapshot.State.GetPropertyNames() {
-		if snapshot.State.ShouldIgnoreOrder(name) {
-			ignoreOrderProperties = append(ignoreOrderProperties, name)
-		}
-	}
-
 	doc := SnapshotDocument{
 		GlobalIDKey: snapshot.GlobalID.Value(),
 		State: StateDocument{
 			Properties:            properties,
-			IgnoreOrderProperties: ignoreOrderProperties,
+			IgnoreOrderProperties: snapshot.State.GetIgnoreOrderPropertyNames(),
+			EntityProperties:      snapshot.State.GetEntityPropertyNames(),
 		},
 		ChangedProperties: snapshot.ChangedProperties,
 		Type:              string(snapshot.Type),
@@ -310,6 +381,9 @@ func (r *Repository) documentToSnapshot(doc SnapshotDocument) (core.Snapshot, er
 		ownerID := core.NewInstanceID(doc.GlobalID.OwnerID.Entity, doc.GlobalID.OwnerID.CdoID)
 		globalID = core.NewValueObjectID(doc.GlobalID.ValueObject, ownerID, doc.GlobalID.Fragment)
 	}
+	if globalID == nil {
+		return core.Snapshot{}, fmt.Errorf("snapshot document has an invalid global ID")
+	}
 
 	properties := make(map[string]string)
 	for _, prop := range doc.CommitMetadata.Properties {
@@ -321,7 +395,7 @@ func (r *Repository) documentToSnapshot(doc SnapshotDocument) (core.Snapshot, er
 	if len(doc.State.Properties) > 0 {
 		properties := make(map[string]any, len(doc.State.Properties))
 		maps.Copy(properties, doc.State.Properties)
-		snapshotState = core.NewSnapshotStateWithOptions(properties, doc.State.IgnoreOrderProperties)
+		snapshotState = core.NewSnapshotStateWithMetadata(properties, doc.State.IgnoreOrderProperties, doc.State.EntityProperties)
 	} else {
 		snapshotState = core.EmptySnapshotState()
 	}
@@ -370,47 +444,9 @@ func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.Global
 
 // GetSnapshots returns snapshots matching the given query.
 func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core.Snapshot, error) {
-	filter := bson.D{}
-
-	switch query.Type {
-	case core.QueryByInstanceID:
-		if query.InstanceID != nil {
-			filter = append(filter, bson.E{Key: fieldGlobalIDKey, Value: query.InstanceID.Value()})
-		}
-	case core.QueryByClass:
-		filter = append(filter, bson.E{
-			Key: "$or",
-			Value: bson.A{
-				bson.D{{Key: fieldGlobalIDEntity, Value: query.TypeName}},
-				bson.D{{Key: fieldGlobalIDValueObject, Value: query.TypeName}},
-			},
-		})
-	case core.QueryAny:
-		// No filter for QueryAny
-	}
-
-	if query.Version > 0 {
-		filter = append(filter, bson.E{Key: fieldVersion, Value: query.Version})
-	}
-
-	if query.Author != "" {
-		filter = append(filter, bson.E{Key: fieldCommitAuthor, Value: query.Author})
-	}
-
-	if !query.CommitID.IsZero() {
-		filter = append(filter, bson.E{Key: fieldCommitID, Value: query.CommitID.String()})
-	}
-
-	if !query.FromDate.IsZero() {
-		filter = append(filter, bson.E{Key: fieldCommitDate, Value: bson.D{{Key: "$gte", Value: query.FromDate}}})
-	}
-
-	if !query.ToDate.IsZero() {
-		filter = append(filter, bson.E{Key: fieldCommitDate, Value: bson.D{{Key: "$lte", Value: query.ToDate}}})
-	}
-
-	if query.ChangedProperty != "" {
-		filter = append(filter, bson.E{Key: fieldChangedProperties, Value: query.ChangedProperty})
+	filter, err := snapshotFilter(query)
+	if err != nil {
+		return nil, err
 	}
 
 	opts := options.Find().SetSort(bson.D{
@@ -451,9 +487,65 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 	return snapshots, nil
 }
 
+func snapshotFilter(query core.Query) (bson.D, error) {
+	if err := query.Validate(); err != nil {
+		return nil, err
+	}
+	filter := bson.D{}
+
+	switch query.Type {
+	case core.QueryByInstanceID:
+		if query.InstanceID != nil {
+			filter = append(filter, bson.E{Key: fieldGlobalIDKey, Value: query.InstanceID.Value()})
+		}
+	case core.QueryByClass:
+		filter = append(filter, bson.E{
+			Key: "$or",
+			Value: bson.A{
+				bson.D{{Key: fieldGlobalIDEntity, Value: query.TypeName}},
+				bson.D{{Key: fieldGlobalIDValueObject, Value: query.TypeName}},
+			},
+		})
+	case core.QueryAny:
+		// No filter for QueryAny
+	}
+
+	if query.Version > 0 {
+		filter = append(filter, bson.E{Key: fieldVersion, Value: query.Version})
+	}
+
+	if query.Author != "" {
+		filter = append(filter, bson.E{Key: fieldCommitAuthor, Value: query.Author})
+	}
+
+	if !query.CommitID.IsZero() {
+		filter = append(filter, bson.E{Key: fieldCommitID, Value: query.CommitID.String()})
+	}
+
+	dateRange := bson.D{}
+	if !query.FromDate.IsZero() {
+		dateRange = append(dateRange, bson.E{Key: "$gte", Value: query.FromDate})
+	}
+	if !query.ToDate.IsZero() {
+		dateRange = append(dateRange, bson.E{Key: "$lte", Value: query.ToDate})
+	}
+	if len(dateRange) > 0 {
+		filter = append(filter, bson.E{Key: fieldCommitDate, Value: dateRange})
+	}
+
+	if query.ChangedProperty != "" {
+		filter = append(filter, bson.E{Key: fieldChangedProperties, Value: query.ChangedProperty})
+	}
+
+	return filter, nil
+}
+
 // GetSnapshot returns a specific snapshot by GlobalID and version.
 // Returns nil, nil if no such snapshot exists.
 func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, version int64) (*core.Snapshot, error) {
+	if version <= 0 {
+		return nil, core.ErrInvalidVersion
+	}
 	filter := bson.D{
 		{Key: fieldGlobalIDKey, Value: globalID.Value()},
 		{Key: fieldVersion, Value: version},

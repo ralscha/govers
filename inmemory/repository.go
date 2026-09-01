@@ -5,6 +5,8 @@ package inmemory
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"slices"
 	"sync"
 
@@ -16,7 +18,6 @@ import (
 type Repository struct {
 	mu        sync.RWMutex
 	snapshots map[string][]core.Snapshot // key: GlobalID.Value()
-	commits   []core.Commit
 	headID    core.CommitID
 }
 
@@ -24,28 +25,47 @@ type Repository struct {
 func New() *Repository {
 	return &Repository{
 		snapshots: make(map[string][]core.Snapshot),
-		commits:   make([]core.Commit, 0),
 	}
 }
 
 // GetHeadID returns the latest CommitID, or zero CommitID if no commits exist.
-func (r *Repository) GetHeadID(_ context.Context) (core.CommitID, error) {
+func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
+	if err := ctx.Err(); err != nil {
+		return core.CommitID{}, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.headID, nil
 }
 
 // Persist saves a commit and its snapshots to the repository.
-func (r *Repository) Persist(_ context.Context, commit core.Commit) error {
+func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.commits = append(r.commits, commit)
+	expectedID := r.headID.Next()
+	if commit.Metadata.ID != expectedID {
+		return fmt.Errorf("%w: expected commit ID %s, got %s", core.ErrConcurrentCommit, expectedID, commit.Metadata.ID)
+	}
+	for _, snapshot := range commit.Snapshots {
+		history := r.snapshots[snapshot.GlobalID.Value()]
+		expectedVersion := int64(1)
+		if len(history) > 0 {
+			expectedVersion = history[len(history)-1].Version + 1
+		}
+		if snapshot.Version != expectedVersion {
+			return fmt.Errorf("%w: expected snapshot version %d for %s, got %d", core.ErrConcurrentCommit, expectedVersion, snapshot.GlobalID.Value(), snapshot.Version)
+		}
+	}
+
 	r.headID = commit.Metadata.ID
 
 	for _, snapshot := range commit.Snapshots {
 		key := snapshot.GlobalID.Value()
-		r.snapshots[key] = append(r.snapshots[key], snapshot)
+		r.snapshots[key] = append(r.snapshots[key], cloneSnapshot(snapshot))
 	}
 
 	return nil
@@ -53,7 +73,10 @@ func (r *Repository) Persist(_ context.Context, commit core.Commit) error {
 
 // GetLatestSnapshot returns the most recent snapshot for the given GlobalID.
 // Returns nil if no snapshot exists for this GlobalID.
-func (r *Repository) GetLatestSnapshot(_ context.Context, globalID core.GlobalID) (*core.Snapshot, error) {
+func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.GlobalID) (*core.Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -63,12 +86,18 @@ func (r *Repository) GetLatestSnapshot(_ context.Context, globalID core.GlobalID
 		return nil, nil
 	}
 
-	latest := snapshots[len(snapshots)-1]
+	latest := cloneSnapshot(snapshots[len(snapshots)-1])
 	return &latest, nil
 }
 
 // GetSnapshots returns snapshots matching the given query.
-func (r *Repository) GetSnapshots(_ context.Context, query core.Query) ([]core.Snapshot, error) {
+func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core.Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := query.Validate(); err != nil {
+		return nil, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -107,6 +136,18 @@ func (r *Repository) GetSnapshots(_ context.Context, query core.Query) ([]core.S
 			}
 			return 1
 		}
+		if a.CommitMetadata.ID.MajorID != b.CommitMetadata.ID.MajorID {
+			if a.CommitMetadata.ID.MajorID > b.CommitMetadata.ID.MajorID {
+				return -1
+			}
+			return 1
+		}
+		if a.CommitMetadata.ID.MinorID != b.CommitMetadata.ID.MinorID {
+			if a.CommitMetadata.ID.MinorID > b.CommitMetadata.ID.MinorID {
+				return -1
+			}
+			return 1
+		}
 
 		if a.Version > b.Version {
 			return -1
@@ -127,13 +168,22 @@ func (r *Repository) GetSnapshots(_ context.Context, query core.Query) ([]core.S
 	if query.Limit > 0 && query.Limit < len(results) {
 		results = results[:query.Limit]
 	}
+	for i := range results {
+		results[i] = cloneSnapshot(results[i])
+	}
 
 	return results, nil
 }
 
 // GetSnapshot returns a specific snapshot by GlobalID and version.
 // Returns nil, nil if no such snapshot exists.
-func (r *Repository) GetSnapshot(_ context.Context, globalID core.GlobalID, version int64) (*core.Snapshot, error) {
+func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, version int64) (*core.Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if version <= 0 {
+		return nil, core.ErrInvalidVersion
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -145,7 +195,8 @@ func (r *Repository) GetSnapshot(_ context.Context, globalID core.GlobalID, vers
 
 	for i := range snapshots {
 		if snapshots[i].Version == version {
-			return &snapshots[i], nil
+			snapshot := cloneSnapshot(snapshots[i])
+			return &snapshot, nil
 		}
 	}
 
@@ -194,8 +245,14 @@ func (r *Repository) Clear() {
 	defer r.mu.Unlock()
 
 	r.snapshots = make(map[string][]core.Snapshot)
-	r.commits = make([]core.Commit, 0)
 	r.headID = core.CommitID{}
+}
+
+func cloneSnapshot(snapshot core.Snapshot) core.Snapshot {
+	snapshot.State = snapshot.State.Clone()
+	snapshot.ChangedProperties = append([]string(nil), snapshot.ChangedProperties...)
+	snapshot.CommitMetadata.Properties = maps.Clone(snapshot.CommitMetadata.Properties)
+	return snapshot
 }
 
 // Count returns the total number of snapshots in the repository.

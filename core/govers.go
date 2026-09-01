@@ -2,9 +2,24 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
+)
+
+var (
+	// ErrRepositoryNotConfigured is returned when an operation requires a repository.
+	ErrRepositoryNotConfigured = errors.New("repository not configured")
+	// ErrObjectDeleted is returned when attempting to commit a terminal object.
+	ErrObjectDeleted = errors.New("object is deleted")
+	// ErrInvalidVersion is returned when a snapshot version is not positive.
+	ErrInvalidVersion = errors.New("snapshot version must be positive")
+	// ErrConcurrentCommit is returned when another writer advances repository
+	// history after a commit has selected its ID.
+	ErrConcurrentCommit = errors.New("concurrent commit conflict")
 )
 
 // Govers is the main entry point for the object versioning library.
@@ -39,7 +54,12 @@ func New(opts ...Option) *Govers {
 	}
 
 	for _, opt := range opts {
-		opt(g)
+		if opt != nil {
+			opt(g)
+		}
+	}
+	if g.snapshotFactory == nil {
+		g.snapshotFactory = NewSnapshotFactory()
 	}
 
 	return g
@@ -54,8 +74,8 @@ func (g *Govers) Commit(ctx context.Context, author string, obj any) (*Commit, e
 
 // CommitWithProperties saves a new version of the object with custom commit properties.
 func (g *Govers) CommitWithProperties(ctx context.Context, author string, obj any, properties map[string]string) (*Commit, error) {
-	if g.repository == nil {
-		return nil, fmt.Errorf("repository not configured")
+	if !repositoryAvailable(g.repository) {
+		return nil, ErrRepositoryNotConfigured
 	}
 
 	g.mu.Lock()
@@ -71,10 +91,7 @@ func (g *Govers) CommitWithProperties(ctx context.Context, author string, obj an
 	newCommitID := headID.Next()
 
 	// Create commit metadata
-	metadata := NewCommitMetadata(newCommitID, author)
-	for k, v := range properties {
-		metadata = metadata.WithProperty(k, v)
-	}
+	metadata := NewCommitMetadata(newCommitID, author).WithProperties(properties)
 
 	// Extract global ID
 	globalID, err := g.snapshotFactory.ExtractGlobalID(obj)
@@ -104,6 +121,9 @@ func (g *Govers) CommitWithProperties(ctx context.Context, author string, obj an
 		snapshotType = Initial
 		version = 1
 	} else {
+		if latestSnapshot.IsTerminal() {
+			return nil, ErrObjectDeleted
+		}
 		// Update existing object - compare states directly
 		snapshotType = Update
 		version = latestSnapshot.Version + 1
@@ -144,8 +164,13 @@ func (g *Govers) CommitWithProperties(ctx context.Context, author string, obj an
 
 // Delete marks an object as deleted by creating a TERMINAL snapshot.
 func (g *Govers) Delete(ctx context.Context, author string, obj any) (*Commit, error) {
-	if g.repository == nil {
-		return nil, fmt.Errorf("repository not configured")
+	return g.DeleteWithProperties(ctx, author, obj, nil)
+}
+
+// DeleteWithProperties marks an object as deleted and attaches custom commit properties.
+func (g *Govers) DeleteWithProperties(ctx context.Context, author string, obj any, properties map[string]string) (*Commit, error) {
+	if !repositoryAvailable(g.repository) {
+		return nil, ErrRepositoryNotConfigured
 	}
 
 	g.mu.Lock()
@@ -161,7 +186,7 @@ func (g *Govers) Delete(ctx context.Context, author string, obj any) (*Commit, e
 	newCommitID := headID.Next()
 
 	// Create commit metadata
-	metadata := NewCommitMetadata(newCommitID, author)
+	metadata := NewCommitMetadata(newCommitID, author).WithProperties(properties)
 
 	// Extract global ID
 	globalID, err := g.snapshotFactory.ExtractGlobalID(obj)
@@ -202,16 +227,19 @@ func (g *Govers) Delete(ctx context.Context, author string, obj any) (*Commit, e
 
 // FindSnapshots returns snapshots matching the given query.
 func (g *Govers) FindSnapshots(ctx context.Context, query Query) ([]Snapshot, error) {
-	if g.repository == nil {
-		return nil, fmt.Errorf("repository not configured")
+	if !repositoryAvailable(g.repository) {
+		return nil, ErrRepositoryNotConfigured
+	}
+	if err := query.Validate(); err != nil {
+		return nil, err
 	}
 	return g.repository.GetSnapshots(ctx, query)
 }
 
 // GetLatestSnapshot returns the most recent snapshot for an object.
 func (g *Govers) GetLatestSnapshot(ctx context.Context, typeName string, id any) (*Snapshot, error) {
-	if g.repository == nil {
-		return nil, fmt.Errorf("repository not configured")
+	if !repositoryAvailable(g.repository) {
+		return nil, ErrRepositoryNotConfigured
 	}
 	globalID := NewInstanceID(typeName, id)
 	return g.repository.GetLatestSnapshot(ctx, globalID)
@@ -219,11 +247,27 @@ func (g *Govers) GetLatestSnapshot(ctx context.Context, typeName string, id any)
 
 // GetSnapshot returns a specific version of an object's snapshot.
 func (g *Govers) GetSnapshot(ctx context.Context, typeName string, id any, version int64) (*Snapshot, error) {
-	if g.repository == nil {
-		return nil, fmt.Errorf("repository not configured")
+	if !repositoryAvailable(g.repository) {
+		return nil, ErrRepositoryNotConfigured
+	}
+	if version <= 0 {
+		return nil, ErrInvalidVersion
 	}
 	globalID := NewInstanceID(typeName, id)
 	return g.repository.GetSnapshot(ctx, globalID, version)
+}
+
+func repositoryAvailable(repository Repository) bool {
+	if repository == nil {
+		return false
+	}
+	value := reflect.ValueOf(repository)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return !value.IsNil()
+	default:
+		return true
+	}
 }
 
 func (g *Govers) createChangesFromStates(globalID GlobalID, metadata CommitMetadata, previousState, currentState SnapshotState, snapshotType SnapshotType, changedProperties []string) []Change {
@@ -238,7 +282,9 @@ func (g *Govers) createChangesFromStates(globalID GlobalID, metadata CommitMetad
 		oldValue := previousState.GetPropertyValue(propName)
 		newValue := currentState.GetPropertyValue(propName)
 
-		change := g.createChangeForProperty(globalID, metadata, propName, oldValue, newValue)
+		ignoreOrder := previousState.ShouldIgnoreOrder(propName) || currentState.ShouldIgnoreOrder(propName)
+		entityReference := previousState.IsEntityReference(propName) || currentState.IsEntityReference(propName)
+		change := g.createChangeForProperty(globalID, metadata, propName, oldValue, newValue, ignoreOrder, entityReference)
 		if change != nil {
 			changes = append(changes, change)
 		}
@@ -255,12 +301,15 @@ const (
 	valueTypeNil   = "nil"
 )
 
-func (g *Govers) createChangeForProperty(globalID GlobalID, metadata CommitMetadata, propName string, oldValue, newValue any) Change {
+func (g *Govers) createChangeForProperty(globalID GlobalID, metadata CommitMetadata, propName string, oldValue, newValue any, ignoreOrder, entityReference bool) Change {
+	if entityReference {
+		return NewReferenceChange(globalID, metadata, propName, dehydratedInstanceID(oldValue), dehydratedInstanceID(newValue))
+	}
 	oldType := getValueType(oldValue)
 	newType := getValueType(newValue)
 
 	if newType == valueTypeSlice || oldType == valueTypeSlice {
-		return g.createListChangeFromValues(globalID, metadata, propName, oldValue, newValue)
+		return g.createListChangeFromValues(globalID, metadata, propName, oldValue, newValue, ignoreOrder)
 	}
 
 	if newType == valueTypeMap || oldType == valueTypeMap {
@@ -268,6 +317,18 @@ func (g *Govers) createChangeForProperty(globalID GlobalID, metadata CommitMetad
 	}
 
 	return NewValueChange(globalID, metadata, propName, oldValue, newValue)
+}
+
+func dehydratedInstanceID(value any) GlobalID {
+	reference, ok := value.(string)
+	if !ok {
+		return nil
+	}
+	typeName, localID, ok := strings.Cut(reference, "/")
+	if !ok {
+		return nil
+	}
+	return NewInstanceID(typeName, localID)
 }
 
 func getValueType(v any) string {
@@ -286,11 +347,39 @@ func getValueType(v any) string {
 	}
 }
 
-func (g *Govers) createListChangeFromValues(globalID GlobalID, metadata CommitMetadata, propName string, oldValue, newValue any) ListChange {
+func (g *Govers) createListChangeFromValues(globalID GlobalID, metadata CommitMetadata, propName string, oldValue, newValue any, ignoreOrder bool) ListChange {
 	var elementChanges []ElementChange
 
 	oldSlice := toSlice(oldValue)
 	newSlice := toSlice(newValue)
+	if !ignoreOrder {
+		prefixLength := 0
+		for prefixLength < min(len(oldSlice), len(newSlice)) && valuesEqual(oldSlice[prefixLength], newSlice[prefixLength]) {
+			prefixLength++
+		}
+		suffixLength := 0
+		for suffixLength < min(len(oldSlice)-prefixLength, len(newSlice)-prefixLength) &&
+			valuesEqual(oldSlice[len(oldSlice)-1-suffixLength], newSlice[len(newSlice)-1-suffixLength]) {
+			suffixLength++
+		}
+
+		oldMiddle := oldSlice[prefixLength : len(oldSlice)-suffixLength]
+		newMiddle := newSlice[prefixLength : len(newSlice)-suffixLength]
+		commonLength := min(len(oldMiddle), len(newMiddle))
+		for i := range commonLength {
+			if !valuesEqual(oldMiddle[i], newMiddle[i]) {
+				elementChanges = append(elementChanges, ElementChange{Index: prefixLength + i, Type: ChangedChangeType, Value: newMiddle[i]})
+			}
+		}
+		for i := commonLength; i < len(newMiddle); i++ {
+			elementChanges = append(elementChanges, ElementChange{Index: prefixLength + i, Type: AddedChangeType, Value: newMiddle[i]})
+		}
+		for i := commonLength; i < len(oldMiddle); i++ {
+			elementChanges = append(elementChanges, ElementChange{Index: prefixLength + i, Type: RemovedChangeType, Value: oldMiddle[i]})
+		}
+		return NewListChange(globalID, metadata, propName, elementChanges)
+	}
+
 	oldMatched := make([]bool, len(oldSlice))
 
 	for i, newElem := range newSlice {
@@ -305,7 +394,7 @@ func (g *Govers) createListChangeFromValues(globalID GlobalID, metadata CommitMe
 		if !found {
 			elementChanges = append(elementChanges, ElementChange{
 				Index: i,
-				Type:  "ADDED",
+				Type:  AddedChangeType,
 				Value: newElem,
 			})
 		}
@@ -315,7 +404,7 @@ func (g *Govers) createListChangeFromValues(globalID GlobalID, metadata CommitMe
 		if !oldMatched[j] {
 			elementChanges = append(elementChanges, ElementChange{
 				Index: j,
-				Type:  "REMOVED",
+				Type:  RemovedChangeType,
 				Value: oldElem,
 			})
 		}
@@ -345,12 +434,13 @@ func (g *Govers) createMapChangeFromValues(globalID GlobalID, metadata CommitMet
 	oldMap := toMap(oldValue)
 	newMap := toMap(newValue)
 
-	for key, newVal := range newMap {
+	for _, key := range sortedMapKeys(newMap) {
+		newVal := newMap[key]
 		if oldVal, exists := oldMap[key]; exists {
 			if !valuesEqual(oldVal, newVal) {
 				entryChanges = append(entryChanges, EntryChange{
 					Key:   key,
-					Type:  "CHANGED",
+					Type:  ChangedChangeType,
 					Left:  oldVal,
 					Right: newVal,
 				})
@@ -358,18 +448,19 @@ func (g *Govers) createMapChangeFromValues(globalID GlobalID, metadata CommitMet
 		} else {
 			entryChanges = append(entryChanges, EntryChange{
 				Key:   key,
-				Type:  "ADDED",
+				Type:  AddedChangeType,
 				Left:  nil,
 				Right: newVal,
 			})
 		}
 	}
 
-	for key, oldVal := range oldMap {
+	for _, key := range sortedMapKeys(oldMap) {
+		oldVal := oldMap[key]
 		if _, exists := newMap[key]; !exists {
 			entryChanges = append(entryChanges, EntryChange{
 				Key:   key,
-				Type:  "REMOVED",
+				Type:  RemovedChangeType,
 				Left:  oldVal,
 				Right: nil,
 			})
@@ -377,6 +468,17 @@ func (g *Govers) createMapChangeFromValues(globalID GlobalID, metadata CommitMet
 	}
 
 	return NewMapChange(globalID, metadata, propName, entryChanges)
+}
+
+func sortedMapKeys(values map[any]any) []any {
+	keys := make([]any, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.SortFunc(keys, func(a, b any) int {
+		return strings.Compare(fmt.Sprintf("%T:%#v", a, a), fmt.Sprintf("%T:%#v", b, b))
+	})
+	return keys
 }
 
 func toMap(v any) map[any]any {

@@ -2,7 +2,11 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 const testPersonName = "John Doe"
@@ -11,6 +15,183 @@ type Address struct {
 	ID     int    `govers:"id"`
 	Street string `json:"street"`
 	City   string `json:"city"`
+}
+
+func TestJSONFieldNameOptionsAndIgnoredField(t *testing.T) {
+	type document struct {
+		ID      int    `govers:"id"`
+		Name    string `json:",omitempty"`
+		Ignored string `json:"-"`
+	}
+
+	state, err := NewSnapshotFactory().ExtractState(document{ID: 1, Name: "Alice", Ignored: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.GetPropertyValue("Name"); got != "Alice" {
+		t.Fatalf("expected default field name for empty JSON tag name, got %v", got)
+	}
+	if !state.IsNull("Ignored") || !state.IsNull("-") {
+		t.Fatal("json ignored field was included in snapshot state")
+	}
+}
+
+func TestEntityTagUnwrapsInterfaceAndPointerChains(t *testing.T) {
+	type holder struct {
+		ID      int `govers:"id"`
+		Address any `govers:"entity" json:"address"`
+	}
+
+	address := &Address{ID: 42}
+	addressPointer := &address
+	state, err := NewSnapshotFactory().ExtractState(&holder{ID: 1, Address: addressPointer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := state.GetPropertyValue("address"), NewInstanceID("Address", 42).Value(); got != want {
+		t.Fatalf("expected entity reference %q, got %v", want, got)
+	}
+}
+
+func TestEntityTagUsesOriginalReferenceForTypeName(t *testing.T) {
+	type holder struct {
+		ID      int      `govers:"id"`
+		Address *Address `govers:"entity" json:"address"`
+	}
+
+	factory := NewSnapshotFactory().WithTypeNameFunc(func(obj any) string {
+		switch obj.(type) {
+		case *Address:
+			return "Location"
+		default:
+			return GetTypeName(obj)
+		}
+	})
+	state, err := factory.ExtractState(holder{ID: 1, Address: &Address{ID: 42}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := state.GetPropertyValue("address"), NewInstanceID("Location", 42).Value(); got != want {
+		t.Fatalf("expected custom entity type %q, got %v", want, got)
+	}
+}
+
+func TestInvalidEntityTagReturnsError(t *testing.T) {
+	type invalid struct {
+		ID        int    `govers:"id"`
+		Reference string `govers:"entity"`
+	}
+	_, err := NewSnapshotFactory().ExtractState(invalid{ID: 1, Reference: "not-an-entity"})
+	if !errors.Is(err, ErrInvalidEntityReference) {
+		t.Fatalf("expected invalid entity reference error, got %v", err)
+	}
+}
+
+func TestDuplicateSnapshotPropertyReturnsError(t *testing.T) {
+	invalidType := reflect.StructOf([]reflect.StructField{
+		{Name: "ID", Type: reflect.TypeFor[int](), Tag: reflect.StructTag(`govers:"id"`)},
+		{Name: "First", Type: reflect.TypeFor[string](), Tag: reflect.StructTag(`json:"name"`)},
+		{Name: "Last", Type: reflect.TypeFor[string](), Tag: reflect.StructTag(`json:"name"`)},
+	})
+	if _, err := NewSnapshotFactory().ExtractState(reflect.New(invalidType).Elem().Interface()); err == nil {
+		t.Fatal("expected duplicate snapshot property error")
+	}
+}
+
+func TestTypeNameUnwrapsPointerChains(t *testing.T) {
+	address := &Address{}
+	addressPointer := &address
+	if got := GetTypeName(addressPointer); got != "Address" {
+		t.Fatalf("unexpected type name: %q", got)
+	}
+	if got := GetTypeNameWithPackage(addressPointer); !strings.HasSuffix(got, ".Address") {
+		t.Fatalf("unexpected qualified type name: %q", got)
+	}
+}
+
+func TestSnapshotStateCopiesMutableValues(t *testing.T) {
+	tags := []string{"go", "audit"}
+	metadata := map[string]int{"priority": 1}
+	state := NewSnapshotState(map[string]any{"tags": tags, "metadata": metadata})
+
+	tags[0] = "changed"
+	metadata["priority"] = 2
+
+	if got := state.GetPropertyValue("tags").([]string)[0]; got != "go" {
+		t.Fatalf("snapshot slice changed through source alias: %q", got)
+	}
+	if got := state.GetPropertyValue("metadata").(map[string]int)["priority"]; got != 1 {
+		t.Fatalf("snapshot map changed through source alias: %d", got)
+	}
+}
+
+func TestSnapshotStateCopiesCyclicPointers(t *testing.T) {
+	type node struct {
+		Value string
+		Next  *node
+	}
+	original := &node{Value: "root"}
+	original.Next = original
+	state := NewSnapshotState(map[string]any{"node": original})
+	cloned := state.GetPropertyValue("node").(*node)
+	if cloned == original || cloned.Next != cloned {
+		t.Fatal("cyclic pointer graph was not cloned independently")
+	}
+}
+
+func TestSnapshotStatePreservesExplicitNilValue(t *testing.T) {
+	state := NewSnapshotState(map[string]any{"optional": nil})
+	if state.Size() != 1 || state.IsNull("optional") || state.GetPropertyValue("optional") != nil {
+		t.Fatalf("explicit nil property was not preserved: %s", state.String())
+	}
+	if !state.Clone().Equals(state) {
+		t.Fatal("state with explicit nil value did not clone correctly")
+	}
+}
+
+func TestSnapshotStatesWithDifferentNilPropertiesAreNotEqual(t *testing.T) {
+	left := NewSnapshotState(map[string]any{"left": nil})
+	right := NewSnapshotState(map[string]any{"right": nil})
+	if left.Equals(right) {
+		t.Fatal("states with different property names compared equal")
+	}
+}
+
+func TestNumericComparisonPreservesLargeIntegerPrecision(t *testing.T) {
+	const first = int64(1 << 53)
+	oldState := NewSnapshotState(map[string]any{"value": first})
+	newState := NewSnapshotState(map[string]any{"value": first + 1})
+	if StatesEqual(oldState, newState) {
+		t.Fatal("different integers above float64's exact range compared equal")
+	}
+}
+
+func TestMapComparisonAcrossNumericKeyTypes(t *testing.T) {
+	left := NewSnapshotState(map[string]any{"values": map[int]string{1: "one"}})
+	right := NewSnapshotState(map[string]any{"values": map[int64]string{1: "one"}})
+	if !StatesEqual(left, right) {
+		t.Fatal("maps with numerically equivalent keys should compare equal")
+	}
+}
+
+func TestQueryValidation(t *testing.T) {
+	tests := []Query{
+		{},
+		{Type: QueryByInstanceID},
+		{Type: QueryByClass},
+		{Type: QueryAny, Limit: -1},
+		{Type: QueryAny, Skip: -1},
+		{Type: QueryAny, Version: -1},
+		{Type: QueryAny, FromDate: time.Now(), ToDate: time.Now().Add(-time.Hour)},
+	}
+	for _, query := range tests {
+		if err := query.Validate(); !errors.Is(err, ErrInvalidQuery) {
+			t.Fatalf("expected invalid query error for %+v, got %v", query, err)
+		}
+	}
+	if err := AnyDomainObjectQuery().Build().Validate(); err != nil {
+		t.Fatalf("valid query rejected: %v", err)
+	}
 }
 
 type PersonWithIgnore struct {
@@ -470,6 +651,25 @@ func TestSnapshotStateJSONRoundTripIgnoreOrder(t *testing.T) {
 
 	if restored.GetPropertyValue("name") != "John" {
 		t.Fatalf("expected name to survive round-trip, got %v", restored.GetPropertyValue("name"))
+	}
+}
+
+func TestSnapshotStateJSONRoundTripEntityMetadata(t *testing.T) {
+	state := NewSnapshotStateBuilder().
+		WithEntityProperty("address").
+		WithPropertyValue("address", "Address/42").
+		Build()
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded SnapshotState
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.IsEntityReference("address") {
+		t.Fatal("entity-reference metadata was lost during JSON round trip")
 	}
 }
 

@@ -2,6 +2,7 @@ package inmemory_test
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -14,6 +15,193 @@ type Employee struct {
 	FirstName string `json:"firstName"`
 	LastName  string `json:"lastName"`
 	Salary    int    `json:"salary"`
+}
+
+func TestInPlaceCollectionMutationCreatesSnapshot(t *testing.T) {
+	type document struct {
+		ID     int            `govers:"id"`
+		Tags   []string       `json:"tags"`
+		Values map[string]int `json:"values"`
+	}
+
+	ctx := context.Background()
+	repo := inmemory.New()
+	g := core.New(core.WithRepository(repo))
+	doc := document{ID: 1, Tags: []string{"one"}, Values: map[string]int{"count": 1}}
+	if _, err := g.Commit(ctx, "author", &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	doc.Tags[0] = "two"
+	doc.Values["count"] = 2
+	commit, err := g.Commit(ctx, "author", &doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit == nil {
+		t.Fatal("in-place collection mutations were not detected")
+	}
+	if got := commit.Snapshots[0].ChangedProperties; !slices.Equal(got, []string{"tags", "values"}) {
+		t.Fatalf("unexpected changed properties: %v", got)
+	}
+}
+
+func TestReturnedSnapshotCannotMutateRepository(t *testing.T) {
+	type document struct {
+		ID     int            `govers:"id"`
+		Values map[string]int `json:"values"`
+	}
+
+	ctx := context.Background()
+	repo := inmemory.New()
+	g := core.New(core.WithRepository(repo))
+	if _, err := g.Commit(ctx, "author", document{ID: 1, Values: map[string]int{"count": 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := g.GetLatestSnapshot(ctx, "document", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil {
+		t.Fatal("snapshot not found")
+	}
+	first.State.GetPropertyValue("values").(map[string]int)["count"] = 99
+
+	second, err := g.GetLatestSnapshot(ctx, "document", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := second.State.GetPropertyValue("values").(map[string]int)["count"]; got != 1 {
+		t.Fatalf("repository snapshot was mutated through returned value: %d", got)
+	}
+}
+
+func TestOrderedListReorderHasElementChanges(t *testing.T) {
+	type document struct {
+		ID    int      `govers:"id"`
+		Items []string `json:"items"`
+	}
+
+	ctx := context.Background()
+	repo := inmemory.New()
+	g := core.New(core.WithRepository(repo))
+	doc := document{ID: 1, Items: []string{"a", "b"}}
+	if _, err := g.Commit(ctx, "author", doc); err != nil {
+		t.Fatal(err)
+	}
+	doc.Items = []string{"b", "a"}
+	commit, err := g.Commit(ctx, "author", doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change, ok := commit.Changes[0].(core.ListChange)
+	if !ok {
+		t.Fatalf("expected list change, got %T", commit.Changes[0])
+	}
+	if len(change.ElementChanges) != 2 {
+		t.Fatalf("expected two positional changes, got %v", change.ElementChanges)
+	}
+	for _, element := range change.ElementChanges {
+		if element.Type != core.ChangedChangeType {
+			t.Fatalf("expected changed element, got %s", element.Type)
+		}
+	}
+}
+
+func TestOrderedListInsertionIsReportedAsAddition(t *testing.T) {
+	type document struct {
+		ID    int      `govers:"id"`
+		Items []string `json:"items"`
+	}
+
+	ctx := context.Background()
+	repo := inmemory.New()
+	g := core.New(core.WithRepository(repo))
+	doc := document{ID: 1, Items: []string{"a", "b"}}
+	if _, err := g.Commit(ctx, "author", doc); err != nil {
+		t.Fatal(err)
+	}
+	doc.Items = []string{"x", "a", "b"}
+	commit, err := g.Commit(ctx, "author", doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := commit.Changes[0].(core.ListChange)
+	if len(change.ElementChanges) != 1 || change.ElementChanges[0].Type != core.AddedChangeType || change.ElementChanges[0].Index != 0 {
+		t.Fatalf("unexpected insertion change: %v", change.ElementChanges)
+	}
+}
+
+func TestDeleteWithPropertiesAndNoImplicitResurrection(t *testing.T) {
+	ctx := context.Background()
+	repo := inmemory.New()
+	g := core.New(core.WithRepository(repo))
+	emp := Employee{ID: 1}
+	if _, err := g.Commit(ctx, "author", emp); err != nil {
+		t.Fatal(err)
+	}
+	commit, err := g.DeleteWithProperties(ctx, "author", emp, map[string]string{"reason": "duplicate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := commit.Metadata.Properties["reason"]; got != "duplicate" {
+		t.Fatalf("delete property not retained: %q", got)
+	}
+	if _, err := g.Commit(ctx, "author", emp); !errors.Is(err, core.ErrObjectDeleted) {
+		t.Fatalf("expected deleted-object error, got %v", err)
+	}
+}
+
+func TestInvalidQueryAndCanceledContext(t *testing.T) {
+	repo := inmemory.New()
+	if _, err := repo.GetSnapshots(context.Background(), core.Query{}); !errors.Is(err, core.ErrInvalidQuery) {
+		t.Fatalf("expected invalid query error, got %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := repo.GetHeadID(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled context, got %v", err)
+	}
+}
+
+func TestTypedNilRepositoryAndInvalidVersion(t *testing.T) {
+	var repository *inmemory.Repository
+	g := core.New(core.WithRepository(repository))
+	if _, err := g.Commit(context.Background(), "author", Employee{ID: 1}); !errors.Is(err, core.ErrRepositoryNotConfigured) {
+		t.Fatalf("expected repository configuration error, got %v", err)
+	}
+
+	repository = inmemory.New()
+	g = core.New(core.WithRepository(repository))
+	if _, err := g.GetSnapshot(context.Background(), "Employee", 1, 0); !errors.Is(err, core.ErrInvalidVersion) {
+		t.Fatalf("expected invalid version error, got %v", err)
+	}
+	if _, err := repository.GetSnapshot(context.Background(), core.NewInstanceID("Employee", 1), -1); !errors.Is(err, core.ErrInvalidVersion) {
+		t.Fatalf("expected repository invalid version error, got %v", err)
+	}
+}
+
+func TestPersistRejectsStaleCommit(t *testing.T) {
+	repository := inmemory.New()
+	metadata := core.NewCommitMetadata(core.CommitID{MajorID: 1}, "author")
+	snapshot := core.NewSnapshot(
+		core.NewInstanceID("Employee", 1),
+		core.NewSnapshotState(map[string]any{"ID": 1}),
+		core.Initial,
+		1,
+		metadata,
+	)
+	commit := core.NewCommit(metadata).WithSnapshot(snapshot)
+	if err := repository.Persist(context.Background(), commit); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Persist(context.Background(), commit); !errors.Is(err, core.ErrConcurrentCommit) {
+		t.Fatalf("expected concurrent commit conflict, got %v", err)
+	}
+	if repository.Count() != 1 {
+		t.Fatalf("stale commit changed repository: count=%d", repository.Count())
+	}
 }
 
 func TestBasicCommit(t *testing.T) {
@@ -413,6 +601,13 @@ func TestEntityTagChangeDetection(t *testing.T) {
 	found := slices.Contains(snapshot.ChangedProperties, "address")
 	if !found {
 		t.Errorf("Expected 'address' in changed properties, got %v", snapshot.ChangedProperties)
+	}
+	referenceChange, ok := commit.Changes[0].(core.ReferenceChange)
+	if !ok {
+		t.Fatalf("expected ReferenceChange, got %T", commit.Changes[0])
+	}
+	if referenceChange.Left.Value() != "Address/100" || referenceChange.Right.Value() != "Address/200" {
+		t.Fatalf("unexpected reference transition: %s -> %s", referenceChange.Left.Value(), referenceChange.Right.Value())
 	}
 }
 

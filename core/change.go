@@ -16,6 +16,12 @@ const (
 	ListChangeType ChangeType = "ListChange"
 	// MapChangeType indicates a map property changed.
 	MapChangeType ChangeType = "MapChange"
+	// AddedChangeType indicates an element or map entry was added.
+	AddedChangeType ChangeType = "ADDED"
+	// RemovedChangeType indicates an element or map entry was removed.
+	RemovedChangeType ChangeType = "REMOVED"
+	// ChangedChangeType indicates an element or map entry changed in place.
+	ChangedChangeType ChangeType = "CHANGED"
 )
 
 // Change represents a difference between two versions of an object.

@@ -28,6 +28,9 @@ var (
 	ErrNoIDField = errors.New("entity must have an ID field (use `govers:\"id\"` tag)")
 	// ErrNilValue is returned when a nil value is passed.
 	ErrNilValue = errors.New("value cannot be nil")
+	// ErrInvalidEntityReference is returned when an entity-tagged field is not
+	// a struct reference with an ID.
+	ErrInvalidEntityReference = errors.New("entity reference must be a struct with an ID field")
 )
 
 // SnapshotFactory creates snapshots from domain objects.
@@ -70,11 +73,9 @@ func (f *SnapshotFactory) ExtractGlobalID(obj any) (GlobalID, error) {
 	}
 
 	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return nil, ErrNilValue
-		}
-		v = v.Elem()
+	var ok bool
+	if v, ok = indirectValue(v); !ok {
+		return nil, ErrNilValue
 	}
 
 	if v.Kind() != reflect.Struct {
@@ -98,11 +99,9 @@ func (f *SnapshotFactory) ExtractState(obj any) (SnapshotState, error) {
 	}
 
 	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return EmptySnapshotState(), ErrNilValue
-		}
-		v = v.Elem()
+	var ok bool
+	if v, ok = indirectValue(v); !ok {
+		return EmptySnapshotState(), ErrNilValue
 	}
 
 	if v.Kind() != reflect.Struct {
@@ -143,6 +142,7 @@ func (f *SnapshotFactory) extractIDValue(v reflect.Value) (any, error) {
 
 func (f *SnapshotFactory) extractStateFromValue(v reflect.Value) (SnapshotState, error) {
 	builder := NewSnapshotStateBuilder()
+	seenProperties := make(map[string]struct{})
 	t := v.Type()
 
 	for i := 0; i < t.NumField(); i++ {
@@ -158,52 +158,82 @@ func (f *SnapshotFactory) extractStateFromValue(v reflect.Value) (SnapshotState,
 			continue
 		}
 
-		fieldName := f.getFieldName(field)
+		fieldName, include := f.getFieldName(field)
+		if !include {
+			continue
+		}
+		if _, exists := seenProperties[fieldName]; exists {
+			return EmptySnapshotState(), fmt.Errorf("duplicate snapshot property name %q", fieldName)
+		}
+		seenProperties[fieldName] = struct{}{}
 
 		if hasGoversTag(tag, TagIgnoreOrder) {
 			builder.WithIgnoreOrderProperty(fieldName)
 		}
+		if hasGoversTag(tag, TagEntity) {
+			builder.WithEntityProperty(fieldName)
+		}
 
-		value := f.extractValue(fieldValue, tag)
+		value, err := f.extractValue(fieldValue, tag)
+		if err != nil {
+			return EmptySnapshotState(), fmt.Errorf("field %s: %w", field.Name, err)
+		}
 		builder.WithPropertyValue(fieldName, value)
 	}
 
 	return builder.Build(), nil
 }
 
-func (f *SnapshotFactory) getFieldName(field reflect.StructField) string {
-	if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
-		for i := 0; i < len(jsonTag); i++ {
-			if jsonTag[i] == ',' {
-				return jsonTag[:i]
-			}
-		}
-		return jsonTag
+func (f *SnapshotFactory) getFieldName(field reflect.StructField) (string, bool) {
+	jsonTag, present := field.Tag.Lookup("json")
+	if !present {
+		return field.Name, true
 	}
-	return field.Name
+
+	name, _, _ := strings.Cut(jsonTag, ",")
+	if name == "-" {
+		return "", false
+	}
+	if name == "" {
+		return field.Name, true
+	}
+	return name, true
 }
 
-func (f *SnapshotFactory) extractValue(v reflect.Value, tag string) any {
-	if (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
-		return nil
+func (f *SnapshotFactory) extractValue(v reflect.Value, tag string) (any, error) {
+	original := v.Interface()
+	var ok bool
+	if v, ok = indirectValue(v); !ok {
+		return nil, nil
 	}
 
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-
-	if hasGoversTag(tag, TagEntity) && v.Kind() == reflect.Struct {
-		if id, err := f.extractIDValue(v); err == nil {
-			typeName := v.Type().Name()
-			return NewInstanceID(typeName, id).Value()
+	if hasGoversTag(tag, TagEntity) {
+		if v.Kind() != reflect.Struct {
+			return nil, ErrInvalidEntityReference
 		}
+		id, err := f.extractIDValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidEntityReference, err)
+		}
+		typeName := f.getTypeName(original, v.Type())
+		return NewInstanceID(typeName, id).Value(), nil
 	}
 
 	if v.CanInterface() {
-		return v.Interface()
+		return v.Interface(), nil
 	}
 
-	return nil
+	return nil, nil
+}
+
+func indirectValue(v reflect.Value) (reflect.Value, bool) {
+	for v.IsValid() && (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) {
+		if v.IsNil() {
+			return reflect.Value{}, false
+		}
+		v = v.Elem()
+	}
+	return v, v.IsValid()
 }
 
 func hasGoversTag(tag, option string) bool {
@@ -232,7 +262,7 @@ func GetTypeName(obj any) string {
 		return ""
 	}
 	t := reflect.TypeOf(obj)
-	if t.Kind() == reflect.Pointer {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	return t.Name()
@@ -244,7 +274,7 @@ func GetTypeNameWithPackage(obj any) string {
 		return ""
 	}
 	t := reflect.TypeOf(obj)
-	if t.Kind() == reflect.Pointer {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.PkgPath() != "" {

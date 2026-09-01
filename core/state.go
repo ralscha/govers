@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"reflect"
 	"slices"
 	"sort"
@@ -15,6 +16,7 @@ import (
 type SnapshotState struct {
 	properties            map[string]any
 	ignoreOrderProperties []string
+	entityProperties      []string
 }
 
 // NewSnapshotState creates a new SnapshotState from a property map.
@@ -24,25 +26,152 @@ func NewSnapshotState(properties map[string]any) SnapshotState {
 
 // NewSnapshotStateWithOptions creates a new SnapshotState with property map and ignore order settings.
 func NewSnapshotStateWithOptions(properties map[string]any, ignoreOrderProperties []string) SnapshotState {
-	if properties == nil {
-		properties = make(map[string]any)
-	}
+	return NewSnapshotStateWithMetadata(properties, ignoreOrderProperties, nil)
+}
+
+// NewSnapshotStateWithMetadata creates a state with comparison and entity-reference metadata.
+func NewSnapshotStateWithMetadata(properties map[string]any, ignoreOrderProperties, entityProperties []string) SnapshotState {
+	properties = cloneProperties(properties)
 	if ignoreOrderProperties == nil {
 		ignoreOrderProperties = []string{}
 	} else {
 		ignoreOrderProperties = append([]string(nil), ignoreOrderProperties...)
 	}
-	return SnapshotState{properties: properties, ignoreOrderProperties: ignoreOrderProperties}
+	if entityProperties == nil {
+		entityProperties = []string{}
+	} else {
+		entityProperties = append([]string(nil), entityProperties...)
+	}
+	return SnapshotState{
+		properties:            properties,
+		ignoreOrderProperties: ignoreOrderProperties,
+		entityProperties:      entityProperties,
+	}
+}
+
+// Clone returns an independent copy of the state. Collection and pointer
+// values are copied recursively so a domain object can be mutated after a
+// commit without changing its historical snapshot.
+func (s SnapshotState) Clone() SnapshotState {
+	return NewSnapshotStateWithMetadata(s.properties, s.ignoreOrderProperties, s.entityProperties)
+}
+
+func cloneProperties(properties map[string]any) map[string]any {
+	cloned := make(map[string]any, len(properties))
+	visited := make(map[cloneVisit]reflect.Value)
+	for name, value := range properties {
+		if value == nil {
+			cloned[name] = nil
+			continue
+		}
+		cloned[name] = cloneReflectValue(reflect.ValueOf(value), visited).Interface()
+	}
+	return cloned
+}
+
+type cloneVisit struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+func cloneReflectValue(value reflect.Value, visited map[cloneVisit]reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneReflectValue(value.Elem(), visited)
+		result := reflect.New(value.Type()).Elem()
+		result.Set(cloned)
+		return result
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typ: value.Type(), ptr: value.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.New(value.Type().Elem())
+		visited[visit] = result
+		result.Elem().Set(cloneReflectValue(value.Elem(), visited))
+		return result
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typ: value.Type(), ptr: value.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeMapWithSize(value.Type(), value.Len())
+		visited[visit] = result
+		iter := value.MapRange()
+		for iter.Next() {
+			result.SetMapIndex(cloneReflectValue(iter.Key(), visited), cloneReflectValue(iter.Value(), visited))
+		}
+		return result
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typ: value.Type(), ptr: value.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		visited[visit] = result
+		for i := 0; i < value.Len(); i++ {
+			result.Index(i).Set(cloneReflectValue(value.Index(i), visited))
+		}
+		return result
+	case reflect.Array:
+		result := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			result.Index(i).Set(cloneReflectValue(value.Index(i), visited))
+		}
+		return result
+	case reflect.Struct:
+		result := reflect.New(value.Type()).Elem()
+		result.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if result.Field(i).CanSet() && value.Field(i).CanInterface() {
+				result.Field(i).Set(cloneReflectValue(value.Field(i), visited))
+			}
+		}
+		return result
+	default:
+		return value
+	}
 }
 
 // EmptySnapshotState creates an empty SnapshotState.
 func EmptySnapshotState() SnapshotState {
-	return SnapshotState{properties: make(map[string]any), ignoreOrderProperties: []string{}}
+	return SnapshotState{properties: make(map[string]any), ignoreOrderProperties: []string{}, entityProperties: []string{}}
 }
 
 // ShouldIgnoreOrder returns true if the property should ignore order when comparing slices.
 func (s SnapshotState) ShouldIgnoreOrder(propertyName string) bool {
 	return slices.Contains(s.ignoreOrderProperties, propertyName)
+}
+
+// GetIgnoreOrderPropertyNames returns the properties with order-insensitive collection comparison.
+func (s SnapshotState) GetIgnoreOrderPropertyNames() []string {
+	return append([]string(nil), s.ignoreOrderProperties...)
+}
+
+// IsEntityReference returns true if the property stores a dehydrated entity reference.
+func (s SnapshotState) IsEntityReference(propertyName string) bool {
+	return slices.Contains(s.entityProperties, propertyName)
+}
+
+// GetEntityPropertyNames returns the properties containing dehydrated entity references.
+func (s SnapshotState) GetEntityPropertyNames() []string {
+	return append([]string(nil), s.entityProperties...)
 }
 
 // Size returns the number of properties in the state.
@@ -87,6 +216,9 @@ func (s SnapshotState) Equals(other SnapshotState) bool {
 	}
 
 	for name := range s.properties {
+		if other.IsNull(name) {
+			return false
+		}
 		if !s.propertyEquals(other, name) {
 			return false
 		}
@@ -173,23 +305,36 @@ func isNumeric(k reflect.Kind) bool {
 }
 
 func numericEqual(a, b reflect.Value) bool {
-	aFloat := toFloat64(a)
-	bFloat := toFloat64(b)
-	return aFloat == bFloat
+	aNumber := numericRat(a)
+	bNumber := numericRat(b)
+	if aNumber == nil || bNumber == nil {
+		// big.Rat cannot represent infinities or NaN. The ordinary floating
+		// point comparison gives the expected result for those values.
+		if isFloat(a.Kind()) && isFloat(b.Kind()) {
+			return a.Float() == b.Float()
+		}
+		return false
+	}
+	return aNumber.Cmp(bNumber) == 0
 }
 
-func toFloat64(v reflect.Value) float64 {
+func numericRat(v reflect.Value) *big.Rat {
 	//nolint:exhaustive // intentionally only handling numeric types
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return float64(v.Int())
+		return new(big.Rat).SetInt64(v.Int())
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return float64(v.Uint())
+		integer := new(big.Int).SetUint64(v.Uint())
+		return new(big.Rat).SetInt(integer)
 	case reflect.Float32, reflect.Float64:
-		return v.Float()
+		return new(big.Rat).SetFloat64(v.Float())
 	default:
-		return 0
+		return nil
 	}
+}
+
+func isFloat(k reflect.Kind) bool {
+	return k == reflect.Float32 || k == reflect.Float64
 }
 
 func slicesEqual(a, b reflect.Value) bool {
@@ -276,13 +421,23 @@ func mapsEqual(a, b reflect.Value) bool {
 	if a.Len() != b.Len() {
 		return false
 	}
-	for _, key := range a.MapKeys() {
-		aVal := a.MapIndex(key)
-		bVal := b.MapIndex(key)
-		if !bVal.IsValid() {
-			return false
+
+	bKeys := b.MapKeys()
+	matched := make([]bool, len(bKeys))
+	for _, aKey := range a.MapKeys() {
+		found := false
+		for i, bKey := range bKeys {
+			if matched[i] || !valuesEqual(aKey.Interface(), bKey.Interface()) {
+				continue
+			}
+			if !valuesEqual(a.MapIndex(aKey).Interface(), b.MapIndex(bKey).Interface()) {
+				return false
+			}
+			matched[i] = true
+			found = true
+			break
 		}
-		if !valuesEqual(aVal.Interface(), bVal.Interface()) {
+		if !found {
 			return false
 		}
 	}
@@ -332,6 +487,7 @@ func (s SnapshotState) DifferentValues(previous SnapshotState) []string {
 type snapshotStateJSON struct {
 	Properties            map[string]any `json:"properties"`
 	IgnoreOrderProperties []string       `json:"ignoreOrderProperties,omitempty"`
+	EntityProperties      []string       `json:"entityProperties,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler for SnapshotState.
@@ -339,6 +495,7 @@ func (s SnapshotState) MarshalJSON() ([]byte, error) {
 	payload := snapshotStateJSON{
 		Properties:            s.properties,
 		IgnoreOrderProperties: s.ignoreOrderProperties,
+		EntityProperties:      s.entityProperties,
 	}
 	return json.Marshal(payload)
 }
@@ -354,6 +511,7 @@ func (s *SnapshotState) UnmarshalJSON(data []byte) error {
 	}
 	s.properties = payload.Properties
 	s.ignoreOrderProperties = append([]string(nil), payload.IgnoreOrderProperties...)
+	s.entityProperties = append([]string(nil), payload.EntityProperties...)
 	return nil
 }
 
@@ -376,6 +534,7 @@ func (s SnapshotState) String() string {
 type SnapshotStateBuilder struct {
 	properties            map[string]any
 	ignoreOrderProperties []string
+	entityProperties      []string
 }
 
 // NewSnapshotStateBuilder creates a new builder for SnapshotState.
@@ -383,7 +542,16 @@ func NewSnapshotStateBuilder() *SnapshotStateBuilder {
 	return &SnapshotStateBuilder{
 		properties:            make(map[string]any),
 		ignoreOrderProperties: []string{},
+		entityProperties:      []string{},
 	}
+}
+
+// WithEntityProperty marks a property as a dehydrated entity reference.
+func (b *SnapshotStateBuilder) WithEntityProperty(propertyName string) *SnapshotStateBuilder {
+	if !slices.Contains(b.entityProperties, propertyName) {
+		b.entityProperties = append(b.entityProperties, propertyName)
+	}
+	return b
 }
 
 // WithIgnoreOrderProperty marks a property to ignore element order when comparing slices.
@@ -413,5 +581,5 @@ func (b *SnapshotStateBuilder) Contains(propertyName string) bool {
 
 // Build creates the SnapshotState from the builder.
 func (b *SnapshotStateBuilder) Build() SnapshotState {
-	return NewSnapshotStateWithOptions(b.properties, b.ignoreOrderProperties)
+	return NewSnapshotStateWithMetadata(b.properties, b.ignoreOrderProperties, b.entityProperties)
 }

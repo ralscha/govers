@@ -1,6 +1,14 @@
 package core
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+// ErrInvalidQuery is returned when a snapshot query is incomplete or contains
+// contradictory pagination, version, or date filters.
+var ErrInvalidQuery = errors.New("invalid query")
 
 // QueryType indicates what kind of query is being performed.
 type QueryType string
@@ -48,6 +56,44 @@ type Query struct {
 
 	// ChangedProperty filters for snapshots with a specific changed property.
 	ChangedProperty string
+}
+
+// Validate checks that the query is safe and meaningful for every repository
+// implementation. Repository backends call this method as well as Govers so
+// direct repository use has the same behavior.
+func (q Query) Validate() error {
+	if q.Limit < 0 {
+		return fmt.Errorf("%w: limit cannot be negative", ErrInvalidQuery)
+	}
+	if q.Skip < 0 {
+		return fmt.Errorf("%w: skip cannot be negative", ErrInvalidQuery)
+	}
+	if q.Version < 0 {
+		return fmt.Errorf("%w: version cannot be negative", ErrInvalidQuery)
+	}
+	if !q.FromDate.IsZero() && !q.ToDate.IsZero() && q.FromDate.After(q.ToDate) {
+		return fmt.Errorf("%w: from date cannot be after to date", ErrInvalidQuery)
+	}
+
+	switch q.Type {
+	case QueryByInstanceID:
+		if q.InstanceID == nil {
+			return fmt.Errorf("%w: instance ID is required", ErrInvalidQuery)
+		}
+		if q.InstanceID.TypeName() == "" {
+			return fmt.Errorf("%w: instance type name is required", ErrInvalidQuery)
+		}
+	case QueryByClass:
+		if q.TypeName == "" {
+			return fmt.Errorf("%w: class type name is required", ErrInvalidQuery)
+		}
+	case QueryAny:
+		// No identity filter is required.
+	default:
+		return fmt.Errorf("%w: unknown query type %q", ErrInvalidQuery, q.Type)
+	}
+
+	return nil
 }
 
 // QueryBuilder provides a fluent API for building queries.

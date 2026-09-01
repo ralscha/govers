@@ -21,6 +21,21 @@ type Repository struct {
 	pool *pgxpool.Pool
 }
 
+const snapshotSelectColumns = `
+	g.local_id, g.type_name, g.fragment,
+	owner.local_id, owner.type_name,
+	s.state, s.changed_properties, s.type, s.version,
+	c.commit_id::text, c.author, c.commit_date,
+	COALESCE((
+		SELECT jsonb_object_agg(p.property_name, p.property_value)
+		FROM gv_commit_property p
+		WHERE p.commit_fk = c.commit_pk
+	), '{}'::jsonb)`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
 // New creates a new PostgreSQL repository with the given connection pool.
 func New(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
@@ -31,6 +46,10 @@ func NewWithConnString(ctx context.Context, connString string) (*Repository, err
 	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create connection pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to ping PostgreSQL: %w", err)
 	}
 	return &Repository{pool: pool}, nil
 }
@@ -61,6 +80,12 @@ func (r *Repository) CreateSchema(ctx context.Context) error {
 
 		CREATE INDEX IF NOT EXISTS gv_global_id_local_id_idx ON gv_global_id(local_id);
 		CREATE INDEX IF NOT EXISTS gv_global_id_owner_id_fk_idx ON gv_global_id(owner_id_fk);
+		CREATE UNIQUE INDEX IF NOT EXISTS gv_global_id_instance_uidx
+			ON gv_global_id(type_name, local_id)
+			WHERE fragment IS NULL AND owner_id_fk IS NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS gv_global_id_value_object_uidx
+			ON gv_global_id(type_name, owner_id_fk, fragment)
+			WHERE fragment IS NOT NULL AND owner_id_fk IS NOT NULL;
 
 		-- Commit table: stores commit metadata
 		CREATE TABLE IF NOT EXISTS gv_commit (
@@ -98,6 +123,8 @@ func (r *Repository) CreateSchema(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS gv_snapshot_global_id_fk_idx ON gv_snapshot(global_id_fk);
 		CREATE INDEX IF NOT EXISTS gv_snapshot_commit_fk_idx ON gv_snapshot(commit_fk);
 		CREATE INDEX IF NOT EXISTS gv_snapshot_managed_type_idx ON gv_snapshot(managed_type);
+		CREATE UNIQUE INDEX IF NOT EXISTS gv_snapshot_global_id_version_uidx
+			ON gv_snapshot(global_id_fk, version);
 	`
 
 	_, err := r.pool.Exec(ctx, schema)
@@ -176,8 +203,8 @@ func (r *Repository) getOrCreateGlobalID(ctx context.Context, tx pgx.Tx, globalI
 		query = `SELECT global_id_pk FROM gv_global_id WHERE local_id = $1 AND type_name = $2 AND fragment IS NULL`
 		args = []any{localID, typeName}
 	} else {
-		query = `SELECT global_id_pk FROM gv_global_id WHERE local_id = $1 AND type_name = $2 AND fragment = $3`
-		args = []any{localID, typeName, *fragment}
+		query = `SELECT global_id_pk FROM gv_global_id WHERE local_id = $1 AND type_name = $2 AND fragment = $3 AND owner_id_fk = $4`
+		args = []any{localID, typeName, *fragment, *ownerIDFk}
 	}
 
 	err := tx.QueryRow(ctx, query, args...).Scan(&globalIDPk)
@@ -207,6 +234,26 @@ func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Serialize commit-ID allocation across all repository instances sharing
+	// this database. Govers selects the next ID before Persist, so verify that
+	// the selected ID is still current while holding the transaction lock.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(119683, 1)`); err != nil {
+		return fmt.Errorf("failed to lock commit sequence: %w", err)
+	}
+	var headIDDecimal string
+	err = tx.QueryRow(ctx, `SELECT commit_id::text FROM gv_commit ORDER BY commit_id DESC LIMIT 1`).Scan(&headIDDecimal)
+	var headID core.CommitID
+	if err == nil {
+		headID, err = decimalToCommitID(headIDDecimal)
+		if err != nil {
+			return fmt.Errorf("failed to parse head commit ID: %w", err)
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("failed to read head commit ID: %w", err)
+	}
+	if expectedID := headID.Next(); commit.Metadata.ID != expectedID {
+		return fmt.Errorf("%w: expected commit ID %s, got %s", core.ErrConcurrentCommit, expectedID, commit.Metadata.ID)
+	}
 
 	var commitPk int64
 	commitIDDecimal := commitIDToDecimal(commit.Metadata.ID)
@@ -270,31 +317,23 @@ func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
 // GetLatestSnapshot returns the most recent snapshot for the given GlobalID.
 // Returns nil if no snapshot exists for this GlobalID.
 func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.GlobalID) (*core.Snapshot, error) {
-	localID, typeName, fragment := parseGlobalIDParts(globalID)
-
-	var globalIDQuery string
-	var globalIDArgs []any
-	if fragment == "" {
-		globalIDQuery = `SELECT global_id_pk FROM gv_global_id WHERE local_id = $1 AND type_name = $2 AND fragment IS NULL`
-		globalIDArgs = []any{localID, typeName}
-	} else {
-		globalIDQuery = `SELECT global_id_pk FROM gv_global_id WHERE local_id = $1 AND type_name = $2 AND fragment = $3`
-		globalIDArgs = []any{localID, typeName, fragment}
+	condition, args, err := globalIDCondition(globalID, 1)
+	if err != nil {
+		return nil, err
 	}
 
 	row := r.pool.QueryRow(ctx, fmt.Sprintf(`
-		SELECT g.local_id, g.type_name, g.fragment, g.owner_id_fk,
-		       s.state, s.changed_properties, s.type, s.version,
-		       c.commit_id::text, c.author, c.commit_date
+		SELECT %s
 		FROM gv_snapshot s
 		JOIN gv_global_id g ON s.global_id_fk = g.global_id_pk
 		JOIN gv_commit c ON s.commit_fk = c.commit_pk
-		WHERE s.global_id_fk = (%s)
+		LEFT JOIN gv_global_id owner ON g.owner_id_fk = owner.global_id_pk
+		WHERE %s
 		ORDER BY s.version DESC
 		LIMIT 1
-	`, globalIDQuery), globalIDArgs...)
+	`, snapshotSelectColumns, condition), args...)
 
-	snapshot, err := r.scanSnapshot(ctx, row)
+	snapshot, err := r.scanSnapshot(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -307,18 +346,22 @@ func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.Global
 
 // GetSnapshots returns snapshots matching the given query.
 func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core.Snapshot, error) {
+	if err := query.Validate(); err != nil {
+		return nil, err
+	}
 	var conditions []string
 	var args []any
 	argNum := 1
 
 	switch query.Type {
 	case core.QueryByInstanceID:
-		if query.InstanceID != nil {
-			localID := fmt.Sprintf("%v", query.InstanceID.CdoID())
-			conditions = append(conditions, fmt.Sprintf("g.local_id = $%d AND g.type_name = $%d AND g.fragment IS NULL", argNum, argNum+1))
-			args = append(args, localID, query.InstanceID.TypeName())
-			argNum += 2
+		condition, identityArgs, err := globalIDCondition(*query.InstanceID, argNum)
+		if err != nil {
+			return nil, err
 		}
+		conditions = append(conditions, condition)
+		args = append(args, identityArgs...)
+		argNum += len(identityArgs)
 	case core.QueryByClass:
 		conditions = append(conditions, fmt.Sprintf("s.managed_type = $%d", argNum))
 		args = append(args, query.TypeName)
@@ -359,8 +402,8 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 	}
 
 	if query.ChangedProperty != "" {
-		conditions = append(conditions, fmt.Sprintf("s.changed_properties LIKE $%d", argNum))
-		args = append(args, "%\""+query.ChangedProperty+"\"%")
+		conditions = append(conditions, fmt.Sprintf(`COALESCE(NULLIF(s.changed_properties, '')::jsonb, '[]'::jsonb) ? $%d`, argNum))
+		args = append(args, query.ChangedProperty)
 	}
 
 	whereClause := ""
@@ -369,15 +412,14 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 	}
 
 	sql := fmt.Sprintf(`
-		SELECT g.local_id, g.type_name, g.fragment, g.owner_id_fk,
-		       s.state, s.changed_properties, s.type, s.version,
-		       c.commit_id::text, c.author, c.commit_date
+		SELECT %s
 		FROM gv_snapshot s
 		JOIN gv_global_id g ON s.global_id_fk = g.global_id_pk
 		JOIN gv_commit c ON s.commit_fk = c.commit_pk
+		LEFT JOIN gv_global_id owner ON g.owner_id_fk = owner.global_id_pk
 		%s
-		ORDER BY c.commit_date DESC, s.version DESC
-	`, whereClause)
+		ORDER BY c.commit_date DESC, c.commit_id DESC, s.version DESC, s.snapshot_pk DESC
+	`, snapshotSelectColumns, whereClause)
 
 	if query.Limit > 0 {
 		sql += fmt.Sprintf(" LIMIT %d", query.Limit)
@@ -394,7 +436,7 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 
 	var snapshots []core.Snapshot
 	for rows.Next() {
-		snapshot, err := r.scanSnapshotFromRows(ctx, rows)
+		snapshot, err := r.scanSnapshot(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan snapshot: %w", err)
 		}
@@ -411,32 +453,27 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 // GetSnapshot returns a specific snapshot by GlobalID and version.
 // Returns nil, nil if no such snapshot exists.
 func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, version int64) (*core.Snapshot, error) {
-	localID, typeName, fragment := parseGlobalIDParts(globalID)
-
-	var globalIDQuery string
-	var args []any
-	if fragment == "" {
-		globalIDQuery = `g.local_id = $1 AND g.type_name = $2 AND g.fragment IS NULL`
-		args = []any{localID, typeName, version}
-	} else {
-		globalIDQuery = `g.local_id = $1 AND g.type_name = $2 AND g.fragment = $3`
-		args = []any{localID, typeName, fragment, version}
+	if version <= 0 {
+		return nil, core.ErrInvalidVersion
 	}
-
+	condition, args, err := globalIDCondition(globalID, 1)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, version)
 	versionArgNum := len(args)
 	sql := fmt.Sprintf(`
-		SELECT g.local_id, g.type_name, g.fragment, g.owner_id_fk,
-		       s.state, s.changed_properties, s.type, s.version,
-		       c.commit_id::text, c.author, c.commit_date
+		SELECT %s
 		FROM gv_snapshot s
 		JOIN gv_global_id g ON s.global_id_fk = g.global_id_pk
 		JOIN gv_commit c ON s.commit_fk = c.commit_pk
+		LEFT JOIN gv_global_id owner ON g.owner_id_fk = owner.global_id_pk
 		WHERE %s AND s.version = $%d
-	`, globalIDQuery, versionArgNum)
+	`, snapshotSelectColumns, condition, versionArgNum)
 
 	row := r.pool.QueryRow(ctx, sql, args...)
 
-	snapshot, err := r.scanSnapshot(ctx, row)
+	snapshot, err := r.scanSnapshot(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -447,53 +484,30 @@ func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, ve
 	return snapshot, nil
 }
 
-func (r *Repository) scanSnapshot(ctx context.Context, row pgx.Row) (*core.Snapshot, error) {
+func (r *Repository) scanSnapshot(row rowScanner) (*core.Snapshot, error) {
 	var localID, typeName string
-	var fragment *string
-	var ownerIDFk *int64
-	var state, changedPropsJSON []byte
+	var fragment, ownerLocalID, ownerTypeName *string
+	var state, changedPropsJSON, propertiesJSON []byte
 	var snapshotType string
 	var version int64
 	var commitIDDecimal string
 	var author string
 	var commitDate time.Time
 
-	err := row.Scan(&localID, &typeName, &fragment, &ownerIDFk,
+	err := row.Scan(&localID, &typeName, &fragment, &ownerLocalID, &ownerTypeName,
 		&state, &changedPropsJSON, &snapshotType, &version,
-		&commitIDDecimal, &author, &commitDate)
+		&commitIDDecimal, &author, &commitDate, &propertiesJSON)
 	if err != nil {
 		return nil, err
 	}
 
-	return r.buildSnapshot(ctx, localID, typeName, fragment, ownerIDFk, state, changedPropsJSON,
-		snapshotType, version, commitIDDecimal, author, commitDate)
+	return buildSnapshot(localID, typeName, fragment, ownerLocalID, ownerTypeName, state, changedPropsJSON,
+		snapshotType, version, commitIDDecimal, author, commitDate, propertiesJSON)
 }
 
-func (r *Repository) scanSnapshotFromRows(ctx context.Context, rows pgx.Rows) (*core.Snapshot, error) {
-	var localID, typeName string
-	var fragment *string
-	var ownerIDFk *int64
-	var state, changedPropsJSON []byte
-	var snapshotType string
-	var version int64
-	var commitIDDecimal string
-	var author string
-	var commitDate time.Time
-
-	err := rows.Scan(&localID, &typeName, &fragment, &ownerIDFk,
-		&state, &changedPropsJSON, &snapshotType, &version,
-		&commitIDDecimal, &author, &commitDate)
-	if err != nil {
-		return nil, err
-	}
-
-	return r.buildSnapshot(ctx, localID, typeName, fragment, ownerIDFk, state, changedPropsJSON,
-		snapshotType, version, commitIDDecimal, author, commitDate)
-}
-
-func (r *Repository) buildSnapshot(ctx context.Context, localID, typeName string, fragment *string, ownerIDFk *int64,
+func buildSnapshot(localID, typeName string, fragment, ownerLocalID, ownerTypeName *string,
 	state, changedPropsJSON []byte, snapshotType string, version int64,
-	commitIDDecimal string, author string, commitDate time.Time) (*core.Snapshot, error) {
+	commitIDDecimal string, author string, commitDate time.Time, propertiesJSON []byte) (*core.Snapshot, error) {
 	var changedProperties []string
 	if len(changedPropsJSON) > 0 {
 		if err := json.Unmarshal(changedPropsJSON, &changedProperties); err != nil {
@@ -514,18 +528,17 @@ func (r *Repository) buildSnapshot(ctx context.Context, localID, typeName string
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse commit id: %w", err)
 	}
-	properties, err := r.loadCommitProperties(ctx, commitIDDecimal)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load commit properties: %w", err)
+	properties := make(map[string]string)
+	if err := json.Unmarshal(propertiesJSON, &properties); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal commit properties: %w", err)
 	}
 
 	var globalID core.GlobalID
-	if fragment != nil && ownerIDFk != nil {
-		ownerLocalID, ownerTypeName, err := r.getGlobalIDInfo(ctx, *ownerIDFk)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get owner info: %w", err)
+	if fragment != nil {
+		if ownerLocalID == nil || ownerTypeName == nil {
+			return nil, fmt.Errorf("value object snapshot is missing its owner")
 		}
-		ownerID := core.NewInstanceID(ownerTypeName, ownerLocalID)
+		ownerID := core.NewInstanceID(*ownerTypeName, *ownerLocalID)
 		globalID = core.NewValueObjectID(typeName, ownerID, *fragment)
 	} else {
 		globalID = core.NewInstanceID(typeName, localID)
@@ -548,46 +561,16 @@ func (r *Repository) buildSnapshot(ctx context.Context, localID, typeName string
 	return &snapshot, nil
 }
 
-func (r *Repository) loadCommitProperties(ctx context.Context, commitIDDecimal string) (map[string]string, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT p.property_name, p.property_value
-		FROM gv_commit_property p
-		JOIN gv_commit c ON p.commit_fk = c.commit_pk
-		WHERE c.commit_id = $1
-	`, commitIDDecimal)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	properties := make(map[string]string)
-	for rows.Next() {
-		var name, value string
-		if err := rows.Scan(&name, &value); err != nil {
-			return nil, err
-		}
-		properties[name] = value
-	}
-
-	return properties, rows.Err()
-}
-
-func (r *Repository) getGlobalIDInfo(ctx context.Context, globalIDPk int64) (string, string, error) {
-	var localID, typeName string
-	err := r.pool.QueryRow(ctx, `
-		SELECT local_id, type_name FROM gv_global_id WHERE global_id_pk = $1
-	`, globalIDPk).Scan(&localID, &typeName)
-	return localID, typeName, err
-}
-
-func parseGlobalIDParts(globalID core.GlobalID) (localID, typeName, fragment string) {
+func globalIDCondition(globalID core.GlobalID, firstArg int) (string, []any, error) {
 	switch gid := globalID.(type) {
 	case core.InstanceID:
-		return fmt.Sprintf("%v", gid.CdoID()), gid.TypeName(), ""
+		condition := fmt.Sprintf("g.local_id = $%d AND g.type_name = $%d AND g.fragment IS NULL AND g.owner_id_fk IS NULL", firstArg, firstArg+1)
+		return condition, []any{fmt.Sprintf("%v", gid.CdoID()), gid.TypeName()}, nil
 	case core.ValueObjectID:
-		return fmt.Sprintf("%v", gid.OwnerID().CdoID()), gid.TypeName(), gid.Fragment()
+		condition := fmt.Sprintf("g.type_name = $%d AND g.fragment = $%d AND owner.local_id = $%d AND owner.type_name = $%d AND owner.fragment IS NULL AND owner.owner_id_fk IS NULL", firstArg, firstArg+1, firstArg+2, firstArg+3)
+		return condition, []any{gid.TypeName(), gid.Fragment(), fmt.Sprintf("%v", gid.OwnerID().CdoID()), gid.OwnerID().TypeName()}, nil
 	default:
-		return "", "", ""
+		return "", nil, fmt.Errorf("unknown GlobalID type: %T", globalID)
 	}
 }
 

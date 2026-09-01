@@ -97,6 +97,15 @@ func (m CommitMetadata) WithProperty(key, value string) CommitMetadata {
 	return m
 }
 
+// WithProperties returns a copy of CommitMetadata with all properties added.
+func (m CommitMetadata) WithProperties(properties map[string]string) CommitMetadata {
+	newProps := make(map[string]string, len(m.Properties)+len(properties))
+	maps.Copy(newProps, m.Properties)
+	maps.Copy(newProps, properties)
+	m.Properties = newProps
+	return m
+}
+
 // Snapshot represents a historical state of a domain object at a point in time.
 type Snapshot struct {
 	// GlobalID uniquely identifies the object this snapshot is for.
@@ -124,17 +133,17 @@ type Snapshot struct {
 func NewSnapshot(globalID GlobalID, state SnapshotState, snapshotType SnapshotType, version int64, metadata CommitMetadata) Snapshot {
 	return Snapshot{
 		GlobalID:          globalID,
-		State:             state,
+		State:             state.Clone(),
 		ChangedProperties: nil,
 		Type:              snapshotType,
 		Version:           version,
-		CommitMetadata:    metadata,
+		CommitMetadata:    cloneCommitMetadata(metadata),
 	}
 }
 
 // WithChangedProperties returns a copy of Snapshot with the changed properties set.
 func (s Snapshot) WithChangedProperties(props []string) Snapshot {
-	s.ChangedProperties = props
+	s.ChangedProperties = append([]string(nil), props...)
 	return s
 }
 
@@ -163,7 +172,7 @@ type Commit struct {
 // NewCommit creates a new Commit with the given metadata.
 func NewCommit(metadata CommitMetadata) Commit {
 	return Commit{
-		Metadata:  metadata,
+		Metadata:  cloneCommitMetadata(metadata),
 		Snapshots: make([]Snapshot, 0),
 		Changes:   make([]Change, 0),
 	}
@@ -171,12 +180,23 @@ func NewCommit(metadata CommitMetadata) Commit {
 
 // WithSnapshot returns a copy of Commit with the given snapshot added.
 func (c Commit) WithSnapshot(snapshot Snapshot) Commit {
-	c.Snapshots = append(c.Snapshots, snapshot)
+	snapshots := make([]Snapshot, len(c.Snapshots)+1)
+	copy(snapshots, c.Snapshots)
+	snapshots[len(c.Snapshots)] = snapshot
+	c.Snapshots = snapshots
 	return c
 }
 
 // WithChange returns a copy of Commit with the given change added.
 func (c Commit) WithChange(change Change) Commit {
-	c.Changes = append(c.Changes, change)
+	changes := make([]Change, len(c.Changes)+1)
+	copy(changes, c.Changes)
+	changes[len(c.Changes)] = change
+	c.Changes = changes
 	return c
+}
+
+func cloneCommitMetadata(metadata CommitMetadata) CommitMetadata {
+	metadata.Properties = maps.Clone(metadata.Properties)
+	return metadata
 }

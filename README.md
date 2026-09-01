@@ -8,6 +8,7 @@ A Go library for object auditing and versioning, inspired by [JaVers](https://ja
 - Create `INITIAL`, `UPDATE`, and `TERMINAL` snapshots for object state
 - Query snapshots by instance, type, author, commit ID, date range, version, changed property, limit, and offset
 - Use `govers` struct tags for IDs, ignored fields, entity references, and order-insensitive slices
+- Get typed value, reference, list, and map changes for each successful commit
 - Store snapshots with in-memory, PostgreSQL, or MongoDB repositories
 
 ## Installation
@@ -72,6 +73,18 @@ v1 [INITIAL]: {ID:1, Name:Alice} (changed: [])
 Latest: {ID:1, Name:Alice Smith}
 ```
 
+Committing an unchanged object returns `nil, nil`. Deleting an object creates a terminal snapshot; a later commit for the same ID returns `core.ErrObjectDeleted` rather than silently resurrecting it. To attach metadata to a deletion, use `DeleteWithProperties`:
+
+```go
+_, err := g.DeleteWithProperties(ctx, "admin", &user, map[string]string{
+	"reason": "account closed",
+})
+```
+
+Snapshot state owns independent copies of mutable maps, slices, and pointers, so mutating a domain object after a commit does not rewrite in-memory history.
+
+Repositories protect their global commit sequence when multiple `Govers` instances write concurrently. A losing writer receives an error wrapping `core.ErrConcurrentCommit`; retry the complete commit operation against the new head.
+
 ## Tags
 
 - `govers:"id"` marks the object ID field. Fields named `ID`, `Id`, `id`, `Uuid`, `UUID`, or `uuid` are also accepted.
@@ -120,10 +133,12 @@ task build
 Without Task installed:
 
 ```bash
-go test github.com/ralscha/govers/core/... github.com/ralscha/govers/inmemory/... github.com/ralscha/govers/mongodb/... github.com/ralscha/govers/postgres/...
+go test github.com/ralscha/govers/core/... github.com/ralscha/govers/demo/... github.com/ralscha/govers/inmemory/... github.com/ralscha/govers/mongodb/... github.com/ralscha/govers/postgres/...
 ```
 
 MongoDB and PostgreSQL tests use Testcontainers and skip when a container provider is unavailable.
+
+Queries are validated consistently by all backends. Negative pagination or version filters, incomplete instance/class queries, and reversed date ranges return an error wrapping `core.ErrInvalidQuery`.
 
 ## License
 

@@ -3,7 +3,7 @@
 version: '3'
 
 vars:
-  MODULES: github.com/ralscha/govers/core/... github.com/ralscha/govers/inmemory/... github.com/ralscha/govers/mongodb/... github.com/ralscha/govers/postgres/...
+  MODULES: github.com/ralscha/govers/core/... github.com/ralscha/govers/demo/... github.com/ralscha/govers/inmemory/... github.com/ralscha/govers/mongodb/... github.com/ralscha/govers/postgres/...
 
 tasks:
   default:
@@ -63,7 +63,11 @@ tasks:
   verify:
     desc: Verify dependencies
     cmds:
-      - "go mod verify"
+      - cmd: cd core && go mod verify
+      - cmd: cd demo && go mod verify
+      - cmd: cd inmemory && go mod verify
+      - cmd: cd mongodb && go mod verify
+      - cmd: cd postgres && go mod verify
 
   clean:
     desc: Clean build artifacts and cache
@@ -77,8 +81,8 @@ tasks:
         ignore_error: true
 
   check:
-    desc: Run all checks (fmt, vet, test)
-    deps: [fmt, vet, test]
+    desc: Run all checks (format, vet, test)
+    deps: [format, vet, test]
 
   lint:
     desc: Run golangci-lint in Docker
