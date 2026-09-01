@@ -1,7 +1,8 @@
 package core
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -483,29 +484,50 @@ func (s SnapshotState) DifferentValues(previous SnapshotState) []string {
 	return different
 }
 
-// MarshalJSON implements json.Marshaler for SnapshotState.
+// snapshotStateJSON is the JSON representation of SnapshotState.
 type snapshotStateJSON struct {
 	Properties            map[string]any `json:"properties"`
 	IgnoreOrderProperties []string       `json:"ignoreOrderProperties,omitempty"`
 	EntityProperties      []string       `json:"entityProperties,omitempty"`
 }
 
-// MarshalJSON implements json.Marshaler for SnapshotState.
+// MarshalJSON implements the legacy JSON marshaling interface for compatibility.
 func (s SnapshotState) MarshalJSON() ([]byte, error) {
-	payload := snapshotStateJSON{
-		Properties:            s.properties,
-		IgnoreOrderProperties: s.ignoreOrderProperties,
-		EntityProperties:      s.entityProperties,
-	}
-	return json.Marshal(payload)
+	return json.Marshal(s.jsonPayload())
 }
 
-// UnmarshalJSON implements json.Unmarshaler for SnapshotState.
+// MarshalJSONTo implements json.MarshalerTo.
+func (s SnapshotState) MarshalJSONTo(out *jsontext.Encoder) error {
+	return json.MarshalEncode(out, s.jsonPayload())
+}
+
+// UnmarshalJSON implements the legacy JSON unmarshaling interface for compatibility.
 func (s *SnapshotState) UnmarshalJSON(data []byte) error {
 	var payload snapshotStateJSON
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return err
 	}
+	return s.setJSONPayload(payload)
+}
+
+// UnmarshalJSONFrom implements json.UnmarshalerFrom.
+func (s *SnapshotState) UnmarshalJSONFrom(in *jsontext.Decoder) error {
+	var payload snapshotStateJSON
+	if err := json.UnmarshalDecode(in, &payload); err != nil {
+		return err
+	}
+	return s.setJSONPayload(payload)
+}
+
+func (s SnapshotState) jsonPayload() snapshotStateJSON {
+	return snapshotStateJSON{
+		Properties:            s.properties,
+		IgnoreOrderProperties: s.ignoreOrderProperties,
+		EntityProperties:      s.entityProperties,
+	}
+}
+
+func (s *SnapshotState) setJSONPayload(payload snapshotStateJSON) error {
 	if payload.Properties == nil {
 		return fmt.Errorf("snapshot state json missing properties")
 	}
@@ -514,6 +536,11 @@ func (s *SnapshotState) UnmarshalJSON(data []byte) error {
 	s.entityProperties = append([]string(nil), payload.EntityProperties...)
 	return nil
 }
+
+var (
+	_ json.MarshalerTo     = SnapshotState{}
+	_ json.UnmarshalerFrom = (*SnapshotState)(nil)
+)
 
 // String returns a string representation of the state.
 func (s SnapshotState) String() string {

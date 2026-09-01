@@ -1,7 +1,7 @@
 package core
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"reflect"
 	"strings"
@@ -670,6 +670,39 @@ func TestSnapshotStateJSONRoundTripEntityMetadata(t *testing.T) {
 	}
 	if !decoded.IsEntityReference("address") {
 		t.Fatal("entity-reference metadata was lost during JSON round trip")
+	}
+}
+
+func TestSnapshotStateJSONUsesV2CollectionDefaults(t *testing.T) {
+	state := NewSnapshotState(map[string]any{
+		"tags":       []string(nil),
+		"attributes": map[string]string(nil),
+	})
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload struct {
+		Properties map[string]any `json:"properties"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if tags, ok := payload.Properties["tags"].([]any); !ok || len(tags) != 0 {
+		t.Fatalf("expected nil slice to round-trip as an empty array, got %#v", payload.Properties["tags"])
+	}
+	if attributes, ok := payload.Properties["attributes"].(map[string]any); !ok || len(attributes) != 0 {
+		t.Fatalf("expected nil map to round-trip as an empty object, got %#v", payload.Properties["attributes"])
+	}
+}
+
+func TestSnapshotStateJSONRejectsDuplicateNames(t *testing.T) {
+	var state SnapshotState
+	err := json.Unmarshal([]byte(`{"properties":{"name":"first","name":"last"}}`), &state)
+	if err == nil {
+		t.Fatal("expected duplicate JSON names to be rejected")
 	}
 }
 
