@@ -80,6 +80,7 @@ func cloneReflectValue(value reflect.Value, visited map[cloneVisit]reflect.Value
 		return value
 	}
 
+	//nolint:exhaustive // Kinds without reference-containing values are immutable and returned as-is.
 	switch value.Kind() {
 	case reflect.Interface:
 		if value.IsNil() {

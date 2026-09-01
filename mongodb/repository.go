@@ -248,7 +248,7 @@ func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
 		if err != nil {
 			persistErr := fmt.Errorf("failed to insert snapshot: %w", err)
 			if mongo.IsDuplicateKeyError(err) {
-				persistErr = fmt.Errorf("%w: snapshot version already exists: %v", core.ErrConcurrentCommit, err)
+				persistErr = fmt.Errorf("%w: snapshot version already exists: %w", core.ErrConcurrentCommit, err)
 			}
 			return errors.Join(persistErr, r.removeSnapshots(ctx, insertedIDs))
 		}

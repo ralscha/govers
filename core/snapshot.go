@@ -213,7 +213,7 @@ func (f *SnapshotFactory) extractValue(v reflect.Value, tag string) (any, error)
 		}
 		id, err := f.extractIDValue(v)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidEntityReference, err)
+			return nil, fmt.Errorf("%w: %w", ErrInvalidEntityReference, err)
 		}
 		typeName := f.getTypeName(original, v.Type())
 		return NewInstanceID(typeName, id).Value(), nil

@@ -262,6 +262,7 @@ func repositoryAvailable(repository Repository) bool {
 		return false
 	}
 	value := reflect.ValueOf(repository)
+	//nolint:exhaustive // Only kinds that can contain a typed nil need special handling.
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return !value.IsNil()
@@ -284,10 +285,7 @@ func (g *Govers) createChangesFromStates(globalID GlobalID, metadata CommitMetad
 
 		ignoreOrder := previousState.ShouldIgnoreOrder(propName) || currentState.ShouldIgnoreOrder(propName)
 		entityReference := previousState.IsEntityReference(propName) || currentState.IsEntityReference(propName)
-		change := g.createChangeForProperty(globalID, metadata, propName, oldValue, newValue, ignoreOrder, entityReference)
-		if change != nil {
-			changes = append(changes, change)
-		}
+		changes = append(changes, g.createChangeForProperty(globalID, metadata, propName, oldValue, newValue, ignoreOrder, entityReference))
 	}
 
 	return changes
