@@ -172,6 +172,10 @@ func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 }
 
 func (r *Repository) getOrCreateGlobalID(ctx context.Context, tx pgx.Tx, globalID core.GlobalID) (int64, error) {
+	globalID, err := normalizeGlobalID(globalID)
+	if err != nil {
+		return 0, err
+	}
 	var globalIDPk int64
 	var localID, typeName string
 	var fragment *string
@@ -179,7 +183,7 @@ func (r *Repository) getOrCreateGlobalID(ctx context.Context, tx pgx.Tx, globalI
 
 	switch gid := globalID.(type) {
 	case core.InstanceID:
-		localID = fmt.Sprintf("%v", gid.CdoID())
+		localID = strings.TrimPrefix(gid.Value(), gid.TypeName()+"/")
 		typeName = gid.TypeName()
 		fragment = nil
 		ownerIDFk = nil
@@ -189,7 +193,7 @@ func (r *Repository) getOrCreateGlobalID(ctx context.Context, tx pgx.Tx, globalI
 			return 0, err
 		}
 		ownerIDFk = &ownerPk
-		localID = fmt.Sprintf("%v", gid.OwnerID().CdoID())
+		localID = strings.TrimPrefix(gid.OwnerID().Value(), gid.OwnerID().TypeName()+"/")
 		typeName = gid.TypeName()
 		frag := gid.Fragment()
 		fragment = &frag
@@ -207,7 +211,7 @@ func (r *Repository) getOrCreateGlobalID(ctx context.Context, tx pgx.Tx, globalI
 		args = []any{localID, typeName, *fragment, *ownerIDFk}
 	}
 
-	err := tx.QueryRow(ctx, query, args...).Scan(&globalIDPk)
+	err = tx.QueryRow(ctx, query, args...).Scan(&globalIDPk)
 	if err == nil {
 		return globalIDPk, nil
 	}
@@ -375,6 +379,11 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 		args = append(args, query.Version)
 		argNum++
 	}
+	if query.SnapshotType != "" {
+		conditions = append(conditions, fmt.Sprintf("s.type = $%d", argNum))
+		args = append(args, string(query.SnapshotType))
+		argNum++
+	}
 
 	if query.Author != "" {
 		conditions = append(conditions, fmt.Sprintf("c.author = $%d", argNum))
@@ -418,7 +427,10 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 		JOIN gv_commit c ON s.commit_fk = c.commit_pk
 		LEFT JOIN gv_global_id owner ON g.owner_id_fk = owner.global_id_pk
 		%s
-		ORDER BY c.commit_date DESC, c.commit_id DESC, s.version DESC, s.snapshot_pk DESC
+		ORDER BY c.commit_date DESC, c.commit_id DESC, s.version DESC,
+			CASE WHEN g.fragment IS NULL THEN g.type_name || '/' || g.local_id
+				ELSE owner.type_name || '/' || owner.local_id || '#' || g.fragment END COLLATE "C",
+			s.snapshot_pk
 	`, snapshotSelectColumns, whereClause)
 
 	if query.Limit > 0 {
@@ -562,16 +574,36 @@ func buildSnapshot(localID, typeName string, fragment, ownerLocalID, ownerTypeNa
 }
 
 func globalIDCondition(globalID core.GlobalID, firstArg int) (string, []any, error) {
+	globalID, err := normalizeGlobalID(globalID)
+	if err != nil {
+		return "", nil, err
+	}
 	switch gid := globalID.(type) {
 	case core.InstanceID:
 		condition := fmt.Sprintf("g.local_id = $%d AND g.type_name = $%d AND g.fragment IS NULL AND g.owner_id_fk IS NULL", firstArg, firstArg+1)
-		return condition, []any{fmt.Sprintf("%v", gid.CdoID()), gid.TypeName()}, nil
+		return condition, []any{strings.TrimPrefix(gid.Value(), gid.TypeName()+"/"), gid.TypeName()}, nil
 	case core.ValueObjectID:
 		condition := fmt.Sprintf("g.type_name = $%d AND g.fragment = $%d AND owner.local_id = $%d AND owner.type_name = $%d AND owner.fragment IS NULL AND owner.owner_id_fk IS NULL", firstArg, firstArg+1, firstArg+2, firstArg+3)
-		return condition, []any{gid.TypeName(), gid.Fragment(), fmt.Sprintf("%v", gid.OwnerID().CdoID()), gid.OwnerID().TypeName()}, nil
+		return condition, []any{gid.TypeName(), gid.Fragment(), strings.TrimPrefix(gid.OwnerID().Value(), gid.OwnerID().TypeName()+"/"), gid.OwnerID().TypeName()}, nil
 	default:
 		return "", nil, fmt.Errorf("unknown GlobalID type: %T", globalID)
 	}
+}
+
+func normalizeGlobalID(globalID core.GlobalID) (core.GlobalID, error) {
+	switch id := globalID.(type) {
+	case core.InstanceID, core.ValueObjectID:
+		return globalID, nil
+	case *core.InstanceID:
+		if id != nil {
+			return *id, nil
+		}
+	case *core.ValueObjectID:
+		if id != nil {
+			return *id, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid GlobalID: %T", globalID)
 }
 
 // Clear removes all data from the repository. Useful for testing.

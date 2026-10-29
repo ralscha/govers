@@ -6,7 +6,7 @@ A Go library for object auditing and versioning, inspired by [JaVers](https://ja
 
 - Track changes to domain objects over time
 - Create `INITIAL`, `UPDATE`, and `TERMINAL` snapshots for object state
-- Query snapshots by instance, type, author, commit ID, date range, version, changed property, limit, and offset
+- Query snapshots by instance, type, author, commit ID, date range, version, changed property, snapshot type, limit, and offset
 - Use `govers` struct tags for IDs, ignored fields, entity references, and order-insensitive slices
 - Get typed value, reference, list, and map changes for each successful commit
 - Store snapshots with in-memory, PostgreSQL, or MongoDB repositories
@@ -81,7 +81,22 @@ _, err := g.DeleteWithProperties(ctx, "admin", &user, map[string]string{
 })
 ```
 
+Use `WithSnapshotType` to query only creations, updates, or deletions. It combines with the other query filters:
+
+```go
+query := core.ByClassQuery("User").
+	WithSnapshotType(core.Terminal).
+	ByAuthor("admin").
+	Limit(20).
+	Build()
+deleted, err := g.FindSnapshots(ctx, query)
+```
+
+Both a repeated deletion and an attempted commit after deletion return an error matching `core.ErrObjectDeleted` with `errors.Is`.
+
 Snapshot state owns independent copies of mutable maps, slices, and pointers, so mutating a domain object after a commit does not rewrite in-memory history.
+
+JSON snapshot decoding preserves integer precision with `int64` values (or `uint64` above the signed range); fractional numbers decode as `float64`.
 
 Repositories protect their global commit sequence when multiple `Govers` instances write concurrently. A losing writer receives an error wrapping `core.ErrConcurrentCommit`; retry the complete commit operation against the new head.
 
@@ -120,9 +135,11 @@ defer repo.Close(ctx)
 _ = repo.EnsureSchema(ctx)
 ```
 
+MongoDB's standalone-compatible write path is not transactional: concurrent readers can observe snapshots from an in-progress commit. Failed writes attempt bounded cleanup, including when the request context has expired.
+
 ## Development
 
-This repository is a Go workspace with separate modules for `core`, `inmemory`, `mongodb`, `postgres`, and `demo`. From the repository root, use the Taskfile module list instead of `go test ./...`:
+This repository includes a `go.work` file with separate modules for `core`, `inmemory`, `mongodb`, `postgres`, and `demo`. From the repository root, use the Taskfile module list instead of `go test ./...`:
 
 ```bash
 task test
@@ -130,15 +147,17 @@ task vet
 task build
 ```
 
+`task check` runs formatting, vet, and tests in sequence. `task format` only formats code; use `task fix` to apply Go's automatic code modernization separately.
+
 Without Task installed:
 
 ```bash
-go test github.com/ralscha/govers/core/... github.com/ralscha/govers/demo/... github.com/ralscha/govers/inmemory/... github.com/ralscha/govers/mongodb/... github.com/ralscha/govers/postgres/...
+go test ./core/... ./demo/... ./inmemory/... ./mongodb/... ./postgres/...
 ```
 
 MongoDB and PostgreSQL tests use Testcontainers and skip when a container provider is unavailable.
 
-Queries are validated consistently by all backends. Negative pagination or version filters, incomplete instance/class queries, and reversed date ranges return an error wrapping `core.ErrInvalidQuery`.
+Queries are validated consistently by all backends. Negative pagination, version, or commit ID filters, invalid snapshot types, incomplete instance/class queries, and reversed date ranges return an error wrapping `core.ErrInvalidQuery`.
 
 ## License
 

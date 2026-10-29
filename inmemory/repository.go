@@ -4,6 +4,7 @@
 package inmemory
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
@@ -35,6 +36,9 @@ func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return core.CommitID{}, err
+	}
 	return r.headID, nil
 }
 
@@ -45,20 +49,29 @@ func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	expectedID := r.headID.Next()
 	if commit.Metadata.ID != expectedID {
 		return fmt.Errorf("%w: expected commit ID %s, got %s", core.ErrConcurrentCommit, expectedID, commit.Metadata.ID)
 	}
+	versions := make(map[string]int64, len(commit.Snapshots))
 	for _, snapshot := range commit.Snapshots {
-		history := r.snapshots[snapshot.GlobalID.Value()]
-		expectedVersion := int64(1)
-		if len(history) > 0 {
-			expectedVersion = history[len(history)-1].Version + 1
+		key := snapshot.GlobalID.Value()
+		version, seen := versions[key]
+		if !seen {
+			history := r.snapshots[key]
+			if len(history) > 0 {
+				version = history[len(history)-1].Version
+			}
 		}
+		expectedVersion := version + 1
 		if snapshot.Version != expectedVersion {
-			return fmt.Errorf("%w: expected snapshot version %d for %s, got %d", core.ErrConcurrentCommit, expectedVersion, snapshot.GlobalID.Value(), snapshot.Version)
+			return fmt.Errorf("%w: expected snapshot version %d for %s, got %d", core.ErrConcurrentCommit, expectedVersion, key, snapshot.Version)
 		}
+		versions[key] = snapshot.Version
 	}
 
 	r.headID = commit.Metadata.ID
@@ -79,6 +92,9 @@ func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.Global
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	key := globalID.Value()
 	snapshots, exists := r.snapshots[key]
@@ -100,62 +116,35 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	var results []core.Snapshot
 
 	switch query.Type {
 	case core.QueryByInstanceID:
-		if query.InstanceID != nil {
-			key := query.InstanceID.Value()
-			if snapshots, exists := r.snapshots[key]; exists {
-				results = r.filterSnapshots(snapshots, query)
-			}
-		}
-
-	case core.QueryByClass:
+		results = appendMatchingSnapshots(results, r.snapshots[query.InstanceID.Value()], query)
+	case core.QueryByClass, core.QueryAny:
 		for _, snapshots := range r.snapshots {
-			for _, s := range snapshots {
-				if s.GlobalID.TypeName() == query.TypeName {
-					results = append(results, s)
-				}
-			}
+			results = appendMatchingSnapshots(results, snapshots, query)
 		}
-		results = r.filterSnapshots(results, query)
-
-	case core.QueryAny:
-		for _, snapshots := range r.snapshots {
-			results = append(results, snapshots...)
-		}
-		results = r.filterSnapshots(results, query)
 	}
 
 	slices.SortFunc(results, func(a, b core.Snapshot) int {
-		if !a.CommitMetadata.CommitDate.Equal(b.CommitMetadata.CommitDate) {
-			if a.CommitMetadata.CommitDate.After(b.CommitMetadata.CommitDate) {
-				return -1
-			}
-			return 1
+		if order := b.CommitMetadata.CommitDate.Compare(a.CommitMetadata.CommitDate); order != 0 {
+			return order
 		}
-		if a.CommitMetadata.ID.MajorID != b.CommitMetadata.ID.MajorID {
-			if a.CommitMetadata.ID.MajorID > b.CommitMetadata.ID.MajorID {
-				return -1
-			}
-			return 1
+		if order := cmp.Compare(b.CommitMetadata.ID.MajorID, a.CommitMetadata.ID.MajorID); order != 0 {
+			return order
 		}
-		if a.CommitMetadata.ID.MinorID != b.CommitMetadata.ID.MinorID {
-			if a.CommitMetadata.ID.MinorID > b.CommitMetadata.ID.MinorID {
-				return -1
-			}
-			return 1
+		if order := cmp.Compare(b.CommitMetadata.ID.MinorID, a.CommitMetadata.ID.MinorID); order != 0 {
+			return order
 		}
-
-		if a.Version > b.Version {
-			return -1
+		if order := cmp.Compare(b.Version, a.Version); order != 0 {
+			return order
 		}
-		if a.Version < b.Version {
-			return 1
-		}
-		return 0
+		return cmp.Compare(a.GlobalID.Value(), b.GlobalID.Value())
 	})
 
 	if query.Skip > 0 {
@@ -186,27 +175,31 @@ func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, ve
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	key := globalID.Value()
-	snapshots, exists := r.snapshots[key]
-	if !exists {
+	snapshots := r.snapshots[key]
+	if version > int64(len(snapshots)) {
 		return nil, nil
 	}
 
-	for i := range snapshots {
-		if snapshots[i].Version == version {
-			snapshot := cloneSnapshot(snapshots[i])
-			return &snapshot, nil
-		}
-	}
-
-	return nil, nil
+	// Persist guarantees contiguous versions starting at one.
+	snapshot := cloneSnapshot(snapshots[version-1])
+	return &snapshot, nil
 }
 
-func (r *Repository) filterSnapshots(snapshots []core.Snapshot, query core.Query) []core.Snapshot {
-	filtered := make([]core.Snapshot, 0, len(snapshots))
-
+func appendMatchingSnapshots(filtered, snapshots []core.Snapshot, query core.Query) []core.Snapshot {
 	for _, s := range snapshots {
+		if query.Type == core.QueryByClass && s.GlobalID.TypeName() != query.TypeName {
+			continue
+		}
+
+		if query.SnapshotType != "" && s.Type != query.SnapshotType {
+			continue
+		}
+
 		if query.Version > 0 && s.Version != query.Version {
 			continue
 		}
@@ -249,6 +242,14 @@ func (r *Repository) Clear() {
 }
 
 func cloneSnapshot(snapshot core.Snapshot) core.Snapshot {
+	// Global IDs are immutable values, but callers can pass pointers to them.
+	// Store a value so assigning through a caller-owned pointer cannot rewrite history.
+	switch id := snapshot.GlobalID.(type) {
+	case *core.InstanceID:
+		snapshot.GlobalID = *id
+	case *core.ValueObjectID:
+		snapshot.GlobalID = *id
+	}
 	snapshot.State = snapshot.State.Clone()
 	snapshot.ChangedProperties = append([]string(nil), snapshot.ChangedProperties...)
 	snapshot.CommitMetadata.Properties = maps.Clone(snapshot.CommitMetadata.Properties)

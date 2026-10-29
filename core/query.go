@@ -56,6 +56,9 @@ type Query struct {
 
 	// ChangedProperty filters for snapshots with a specific changed property.
 	ChangedProperty string
+
+	// SnapshotType filters by INITIAL, UPDATE, or TERMINAL (empty = no filter).
+	SnapshotType SnapshotType
 }
 
 // Validate checks that the query is safe and meaningful for every repository
@@ -70,6 +73,14 @@ func (q Query) Validate() error {
 	}
 	if q.Version < 0 {
 		return fmt.Errorf("%w: version cannot be negative", ErrInvalidQuery)
+	}
+	if q.CommitID.MajorID < 0 || q.CommitID.MinorID < 0 {
+		return fmt.Errorf("%w: commit ID cannot be negative", ErrInvalidQuery)
+	}
+	switch q.SnapshotType {
+	case "", Initial, Update, Terminal:
+	default:
+		return fmt.Errorf("%w: unknown snapshot type %q", ErrInvalidQuery, q.SnapshotType)
 	}
 	if !q.FromDate.IsZero() && !q.ToDate.IsZero() && q.FromDate.After(q.ToDate) {
 		return fmt.Errorf("%w: from date cannot be after to date", ErrInvalidQuery)
@@ -177,6 +188,13 @@ func (qb *QueryBuilder) WithCommitID(commitID CommitID) *QueryBuilder {
 // WithChangedProperty filters for snapshots where the given property changed.
 func (qb *QueryBuilder) WithChangedProperty(propertyName string) *QueryBuilder {
 	qb.query.ChangedProperty = propertyName
+	return qb
+}
+
+// WithSnapshotType filters for initial, update, or terminal snapshots.
+// An empty snapshot type removes the filter.
+func (qb *QueryBuilder) WithSnapshotType(snapshotType SnapshotType) *QueryBuilder {
+	qb.query.SnapshotType = snapshotType
 	return qb
 }
 

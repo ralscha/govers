@@ -1,0 +1,9 @@
+go 1.27.3
+
+use (
+	./core
+	./demo
+	./inmemory
+	./mongodb
+	./postgres
+)

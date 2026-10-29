@@ -3,12 +3,15 @@ package core
 import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // SnapshotState represents the normalized state of a domain object as a property-value map.
@@ -73,6 +76,7 @@ func cloneProperties(properties map[string]any) map[string]any {
 type cloneVisit struct {
 	typ reflect.Type
 	ptr uintptr
+	len int
 }
 
 func cloneReflectValue(value reflect.Value, visited map[cloneVisit]reflect.Value) reflect.Value {
@@ -121,7 +125,8 @@ func cloneReflectValue(value reflect.Value, visited map[cloneVisit]reflect.Value
 		if value.IsNil() {
 			return reflect.Zero(value.Type())
 		}
-		visit := cloneVisit{typ: value.Type(), ptr: value.Pointer()}
+		// Slices can share their first element while exposing different lengths.
+		visit := cloneVisit{typ: value.Type(), ptr: value.Pointer(), len: value.Len()}
 		if cloned, ok := visited[visit]; ok {
 			return cloned
 		}
@@ -242,11 +247,36 @@ func valuesEqual(a, b any) bool {
 }
 
 func valuesEqualWithOptions(a, b any, ignoreOrder bool) bool {
-	if a == nil && b == nil {
-		return true
+	return valuesEqualTracking(a, b, ignoreOrder, nil)
+}
+
+type comparisonVisit struct {
+	left  cloneVisit
+	right cloneVisit
+}
+
+func valuesEqualTracking(a, b any, ignoreOrder bool, active map[comparisonVisit]bool) bool {
+	aVal := reflect.ValueOf(a)
+	bVal := reflect.ValueOf(b)
+	aNull := isNullValue(aVal)
+	bNull := isNullValue(bVal)
+	if aNull || bNull {
+		return aNull && bNull
 	}
-	if a == nil || b == nil {
-		return false
+	if aTime, ok := a.(time.Time); ok {
+		if bTime, ok := b.(time.Time); ok {
+			return aTime.Equal(bTime)
+		}
+		if bString, ok := b.(string); ok {
+			bTime, err := time.Parse(time.RFC3339Nano, bString)
+			return err == nil && aTime.Equal(bTime)
+		}
+	}
+	if bTime, ok := b.(time.Time); ok {
+		if aString, ok := a.(string); ok {
+			aTime, err := time.Parse(time.RFC3339Nano, aString)
+			return err == nil && aTime.Equal(bTime)
+		}
 	}
 
 	if aGid, ok := a.(GlobalID); ok {
@@ -256,11 +286,14 @@ func valuesEqualWithOptions(a, b any, ignoreOrder bool) bool {
 		return false
 	}
 
-	aVal := reflect.ValueOf(a)
-	bVal := reflect.ValueOf(b)
-
 	if isNumeric(aVal.Kind()) && isNumeric(bVal.Kind()) {
 		return numericEqual(aVal, bVal)
+	}
+	if aVal.Kind() == reflect.String && bVal.Kind() == reflect.String {
+		return aVal.String() == bVal.String()
+	}
+	if aVal.Kind() == reflect.Bool && bVal.Kind() == reflect.Bool {
+		return aVal.Bool() == bVal.Bool()
 	}
 
 	if aVal.Type() != bVal.Type() {
@@ -274,24 +307,85 @@ func valuesEqualWithOptions(a, b any, ignoreOrder bool) bool {
 		bothSlices := isSliceA && isSliceB
 		bothMaps := isMapA && isMapB
 		if !bothSlices && !bothMaps {
+			if hasJSONRepresentation(aVal) || hasJSONRepresentation(bVal) {
+				return jsonValuesEqual(a, b, ignoreOrder)
+			}
 			return false
 		}
+	}
+
+	// Treat an already active pair as equal while checking the rest of a cyclic
+	// collection. Remove it on return so unsuccessful unordered matches do not
+	// affect later candidates.
+	if (aVal.Kind() == reflect.Map && bVal.Kind() == reflect.Map) ||
+		(aVal.Kind() == reflect.Slice && bVal.Kind() == reflect.Slice) {
+		if aVal.Len() != bVal.Len() {
+			return false
+		}
+		if aVal.Len() == 0 {
+			return true
+		}
+		visit := comparisonVisit{
+			left:  cloneVisit{typ: aVal.Type(), ptr: aVal.Pointer(), len: aVal.Len()},
+			right: cloneVisit{typ: bVal.Type(), ptr: bVal.Pointer(), len: bVal.Len()},
+		}
+		if active[visit] {
+			return true
+		}
+		if active == nil {
+			active = make(map[comparisonVisit]bool)
+		}
+		active[visit] = true
+		defer delete(active, visit)
 	}
 
 	//nolint:exhaustive // intentionally using default for all other kinds
 	switch aVal.Kind() {
 	case reflect.Slice, reflect.Array:
 		if ignoreOrder {
-			return slicesEqualIgnoreOrder(aVal, bVal)
+			return slicesEqualIgnoreOrder(aVal, bVal, active)
 		}
-		return slicesEqual(aVal, bVal)
+		return slicesEqual(aVal, bVal, active)
 	case reflect.Map:
-		return mapsEqual(aVal, bVal)
+		return mapsEqual(aVal, bVal, active)
 	case reflect.Struct:
 		return structsEqual(aVal, bVal)
 	default:
 		return reflect.DeepEqual(a, b)
 	}
+}
+
+func isNullValue(value reflect.Value) bool {
+	// JSON restores nil pointers and interfaces as null. Nil maps and slices
+	// remain collections, matching their JSON v2 empty-object/array encoding.
+	return !value.IsValid() ||
+		((value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil())
+}
+
+// JSON storage restores structs as maps and values such as time.Time and byte
+// slices as strings. Compare those representations without changing the typed
+// values exposed by in-memory snapshots.
+func hasJSONRepresentation(value reflect.Value) bool {
+	return value.Kind() == reflect.Struct || value.Kind() == reflect.Pointer ||
+		((value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && value.Type().Elem().Kind() == reflect.Uint8)
+}
+
+func jsonValuesEqual(a, b any, ignoreOrder bool) bool {
+	normalize := func(value any) (any, error) {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		var result any
+		err = json.Unmarshal(data, &result, json.WithUnmarshalers(snapshotNumberUnmarshalers))
+		return result, err
+	}
+	left, err := normalize(a)
+	if err != nil {
+		return false
+	}
+	right, err := normalize(b)
+	return err == nil && valuesEqualWithOptions(left, right, ignoreOrder)
 }
 
 func isNumeric(k reflect.Kind) bool {
@@ -307,6 +401,35 @@ func isNumeric(k reflect.Kind) bool {
 }
 
 func numericEqual(a, b reflect.Value) bool {
+	// Most comparisons do not need arbitrary precision arithmetic. In
+	// particular, converting two integers to float64 would lose precision.
+	if a.Kind() >= reflect.Int && a.Kind() <= reflect.Int64 {
+		if b.Kind() >= reflect.Int && b.Kind() <= reflect.Int64 {
+			return a.Int() == b.Int()
+		}
+		if b.Kind() >= reflect.Uint && b.Kind() <= reflect.Uint64 {
+			integer := a.Int()
+			if integer < 0 {
+				return false
+			}
+			return uint64(integer) == b.Uint()
+		}
+	}
+	if a.Kind() >= reflect.Uint && a.Kind() <= reflect.Uint64 {
+		if b.Kind() >= reflect.Uint && b.Kind() <= reflect.Uint64 {
+			return a.Uint() == b.Uint()
+		}
+		if b.Kind() >= reflect.Int && b.Kind() <= reflect.Int64 {
+			integer := b.Int()
+			if integer < 0 {
+				return false
+			}
+			return a.Uint() == uint64(integer)
+		}
+	}
+	if isFloat(a.Kind()) && isFloat(b.Kind()) {
+		return a.Float() == b.Float()
+	}
 	aNumber := numericRat(a)
 	bNumber := numericRat(b)
 	if aNumber == nil || bNumber == nil {
@@ -339,19 +462,19 @@ func isFloat(k reflect.Kind) bool {
 	return k == reflect.Float32 || k == reflect.Float64
 }
 
-func slicesEqual(a, b reflect.Value) bool {
+func slicesEqual(a, b reflect.Value, active map[comparisonVisit]bool) bool {
 	if a.Len() != b.Len() {
 		return false
 	}
 	for i := 0; i < a.Len(); i++ {
-		if !valuesEqual(a.Index(i).Interface(), b.Index(i).Interface()) {
+		if !valuesEqualTracking(a.Index(i).Interface(), b.Index(i).Interface(), false, active) {
 			return false
 		}
 	}
 	return true
 }
 
-func slicesEqualIgnoreOrder(a, b reflect.Value) bool {
+func slicesEqualIgnoreOrder(a, b reflect.Value, active map[comparisonVisit]bool) bool {
 	if a.Len() != b.Len() {
 		return false
 	}
@@ -391,7 +514,7 @@ func slicesEqualIgnoreOrder(a, b reflect.Value) bool {
 				continue
 			}
 			bElem := b.Index(j).Interface()
-			if valuesEqual(aElem, bElem) {
+			if valuesEqualTracking(aElem, bElem, false, active) {
 				matched[j] = true
 				found = true
 				break
@@ -419,9 +542,28 @@ func isSimpleComparable(k reflect.Kind) bool {
 	}
 }
 
-func mapsEqual(a, b reflect.Value) bool {
+func mapsEqual(a, b reflect.Value, active map[comparisonVisit]bool) bool {
 	if a.Len() != b.Len() {
 		return false
+	}
+	if a.Type().Key() != b.Type().Key() &&
+		(a.Type().Key().Kind() == reflect.String || b.Type().Key().Kind() == reflect.String) {
+		// JSON object names are strings, including encoded integer and custom
+		// text-marshaled map keys.
+		return jsonValuesEqual(a.Interface(), b.Interface(), false)
+	}
+
+	// Common string and integer keys use Go's map lookup instead of scanning
+	// every key. Different numeric key types still use value-based matching.
+	if a.Type().Key() == b.Type().Key() && isSimpleComparable(a.Type().Key().Kind()) {
+		iter := a.MapRange()
+		for iter.Next() {
+			other := b.MapIndex(iter.Key())
+			if !other.IsValid() || !valuesEqualTracking(iter.Value().Interface(), other.Interface(), false, active) {
+				return false
+			}
+		}
+		return true
 	}
 
 	bKeys := b.MapKeys()
@@ -429,11 +571,11 @@ func mapsEqual(a, b reflect.Value) bool {
 	for _, aKey := range a.MapKeys() {
 		found := false
 		for i, bKey := range bKeys {
-			if matched[i] || !valuesEqual(aKey.Interface(), bKey.Interface()) {
+			if matched[i] || !valuesEqualTracking(aKey.Interface(), bKey.Interface(), false, active) {
 				continue
 			}
-			if !valuesEqual(a.MapIndex(aKey).Interface(), b.MapIndex(bKey).Interface()) {
-				return false
+			if !valuesEqualTracking(a.MapIndex(aKey).Interface(), b.MapIndex(bKey).Interface(), false, active) {
+				continue
 			}
 			matched[i] = true
 			found = true
@@ -505,7 +647,7 @@ func (s SnapshotState) MarshalJSONTo(out *jsontext.Encoder) error {
 // UnmarshalJSON implements the legacy JSON unmarshaling interface for compatibility.
 func (s *SnapshotState) UnmarshalJSON(data []byte) error {
 	var payload snapshotStateJSON
-	if err := json.Unmarshal(data, &payload); err != nil {
+	if err := json.Unmarshal(data, &payload, json.WithUnmarshalers(snapshotNumberUnmarshalers)); err != nil {
 		return err
 	}
 	return s.setJSONPayload(payload)
@@ -514,11 +656,39 @@ func (s *SnapshotState) UnmarshalJSON(data []byte) error {
 // UnmarshalJSONFrom implements json.UnmarshalerFrom.
 func (s *SnapshotState) UnmarshalJSONFrom(in *jsontext.Decoder) error {
 	var payload snapshotStateJSON
-	if err := json.UnmarshalDecode(in, &payload); err != nil {
+	if err := json.UnmarshalDecode(in, &payload, json.WithUnmarshalers(snapshotNumberUnmarshalers)); err != nil {
 		return err
 	}
 	return s.setJSONPayload(payload)
 }
+
+// Decoding every interface number as float64 silently rounds large integer
+// properties. Keep the complete signed/unsigned Go integer range exact, even
+// for values nested inside collections.
+var snapshotNumberUnmarshalers = json.UnmarshalFromFunc(func(in *jsontext.Decoder, value *any) error {
+	if in.PeekKind() != '0' {
+		return errors.ErrUnsupported
+	}
+	token, err := in.ReadToken()
+	if err != nil {
+		return err
+	}
+	number := token.String()
+	if integer, err := strconv.ParseInt(number, 10, 64); err == nil {
+		*value = integer
+		return nil
+	}
+	if integer, err := strconv.ParseUint(number, 10, 64); err == nil {
+		*value = integer
+		return nil
+	}
+	floating, err := strconv.ParseFloat(number, 64)
+	if err != nil {
+		return err
+	}
+	*value = floating
+	return nil
+})
 
 func (s SnapshotState) jsonPayload() snapshotStateJSON {
 	return snapshotStateJSON{

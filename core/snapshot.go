@@ -132,7 +132,12 @@ func (f *SnapshotFactory) extractIDValue(v reflect.Value) (any, error) {
 	}
 
 	for _, name := range []string{"ID", "Id", "id", "Uuid", "UUID", "uuid"} {
-		if field := v.FieldByName(name); field.IsValid() && field.CanInterface() {
+		structField, ok := t.FieldByName(name)
+		if !ok {
+			continue
+		}
+		field, err := v.FieldByIndexErr(structField.Index)
+		if err == nil && field.CanInterface() {
 			return field.Interface(), nil
 		}
 	}

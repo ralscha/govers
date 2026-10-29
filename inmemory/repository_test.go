@@ -756,8 +756,8 @@ func TestDeleteAlreadyDeletedObject(t *testing.T) {
 	}
 
 	_, err = g.Delete(ctx, "test-user", emp)
-	if err == nil {
-		t.Error("Expected error when deleting already deleted object")
+	if !errors.Is(err, core.ErrObjectDeleted) {
+		t.Errorf("Expected ErrObjectDeleted when deleting already deleted object, got %v", err)
 	}
 }
 

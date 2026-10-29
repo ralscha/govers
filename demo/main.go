@@ -33,12 +33,18 @@ func main() {
 
 	// Query snapshots for this user
 	query := core.ByInstanceIDQuery("User", "1").Build()
-	snapshots, _ := g.FindSnapshots(ctx, query)
+	snapshots, err := g.FindSnapshots(ctx, query)
+	if err != nil {
+		panic(err)
+	}
 	for _, s := range snapshots {
 		fmt.Printf("v%d [%s]: %s (changed: %v)\n", s.Version, s.Type, s.State.String(), s.ChangedProperties)
 	}
 
 	// Get latest snapshot directly
-	latest, _ := g.GetLatestSnapshot(ctx, "User", "1")
+	latest, err := g.GetLatestSnapshot(ctx, "User", "1")
+	if err != nil {
+		panic(err)
+	}
 	fmt.Printf("Latest: %s\n", latest.State.String())
 }

@@ -25,6 +25,25 @@ func TestGlobalIDConditionIncludesValueObjectOwnerType(t *testing.T) {
 	}
 }
 
+func TestGlobalIDConditionSupportsPointersAndRejectsNil(t *testing.T) {
+	localID := 7
+	id := core.NewInstanceID("Record", &localID)
+	condition, args, err := globalIDCondition(&id, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if condition == "" || args[0] != strings.TrimPrefix(id.Value(), "Record/") {
+		t.Fatalf("pointer ID lost its identity: %s %v", condition, args)
+	}
+	var nilInstance *core.InstanceID
+	var nilValueObject *core.ValueObjectID
+	for _, invalid := range []core.GlobalID{nil, nilInstance, nilValueObject} {
+		if _, _, err := globalIDCondition(invalid, 1); err == nil {
+			t.Fatalf("expected invalid ID error for %T", invalid)
+		}
+	}
+}
+
 func TestBuildSnapshotIncludesOwnerAndCommitProperties(t *testing.T) {
 	fragment := "billing"
 	ownerID := "7"

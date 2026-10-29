@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"reflect"
@@ -149,10 +150,7 @@ func (g *Govers) CommitWithProperties(ctx context.Context, author string, obj an
 	if latestSnapshot != nil {
 		previousState = latestSnapshot.State
 	}
-	changes := g.createChangesFromStates(globalID, metadata, previousState, currentState, snapshotType, changedProperties)
-	for _, change := range changes {
-		commit = commit.WithChange(change)
-	}
+	commit.Changes = g.createChangesFromStates(globalID, metadata, previousState, currentState, snapshotType, changedProperties)
 
 	// Persist the commit
 	if err := g.repository.Persist(ctx, commit); err != nil {
@@ -205,7 +203,7 @@ func (g *Govers) DeleteWithProperties(ctx context.Context, author string, obj an
 	}
 
 	if latestSnapshot.IsTerminal() {
-		return nil, fmt.Errorf("object is already deleted")
+		return nil, fmt.Errorf("object is already deleted: %w", ErrObjectDeleted)
 	}
 
 	// Create terminal snapshot (empty state)
@@ -272,13 +270,11 @@ func repositoryAvailable(repository Repository) bool {
 }
 
 func (g *Govers) createChangesFromStates(globalID GlobalID, metadata CommitMetadata, previousState, currentState SnapshotState, snapshotType SnapshotType, changedProperties []string) []Change {
-	var changes []Change
-
 	if snapshotType == Initial {
-		changes = append(changes, NewNewObjectCreated(globalID, metadata))
-		return changes
+		return []Change{NewNewObjectCreated(globalID, metadata)}
 	}
 
+	changes := make([]Change, 0, len(changedProperties))
 	for _, propName := range changedProperties {
 		oldValue := previousState.GetPropertyValue(propName)
 		newValue := currentState.GetPropertyValue(propName)
@@ -429,37 +425,83 @@ func toSlice(v any) []any {
 func (g *Govers) createMapChangeFromValues(globalID GlobalID, metadata CommitMetadata, propName string, oldValue, newValue any) MapChange {
 	var entryChanges []EntryChange
 
-	oldMap := toMap(oldValue)
-	newMap := toMap(newValue)
+	oldEntries := sortedMapEntries(oldValue)
+	newEntries := sortedMapEntries(newValue)
+	matched := make([]bool, len(oldEntries))
 
-	for _, key := range sortedMapKeys(newMap) {
-		newVal := newMap[key]
-		if oldVal, exists := oldMap[key]; exists {
-			if !valuesEqual(oldVal, newVal) {
+	// Ordinary string/integer-keyed maps can match entries in constant time.
+	// Heterogeneous keys use the same comparison as snapshot state (for
+	// example, int32(1) and int64(1) identify the same entry).
+	var keyIndex map[any]int
+	var normalizedKeys []string
+	if oldType, newType := reflect.TypeOf(oldValue), reflect.TypeOf(newValue); oldType != nil && newType != nil &&
+		oldType.Kind() == reflect.Map && newType.Kind() == reflect.Map {
+		if oldType.Key() == newType.Key() && isSimpleComparable(oldType.Key().Kind()) {
+			keyIndex = make(map[any]int, len(oldEntries))
+			for i, entry := range oldEntries {
+				keyIndex[entry.key] = i
+			}
+		} else if oldType.Key() != newType.Key() && (oldType.Key().Kind() == reflect.String || newType.Key().Kind() == reflect.String) {
+			// JSON object keys are strings, including integer and TextMarshaler
+			// keys. Match their stored names while retaining the original keys
+			// in the reported changes.
+			oldKeys := jsonMapEntryKeys(oldEntries)
+			newKeys := jsonMapEntryKeys(newEntries)
+			if oldKeys != nil && newKeys != nil {
+				keyIndex = make(map[any]int, len(oldKeys))
+				for i, key := range oldKeys {
+					keyIndex[key] = i
+				}
+				normalizedKeys = newKeys
+			}
+		}
+	}
+
+	for entryIndex, entry := range newEntries {
+		oldIndex := -1
+		if keyIndex != nil {
+			key := entry.key
+			if normalizedKeys != nil {
+				key = normalizedKeys[entryIndex]
+			}
+			if i, exists := keyIndex[key]; exists {
+				oldIndex = i
+			}
+		} else {
+			for i, oldEntry := range oldEntries {
+				if !matched[i] && valuesEqual(oldEntry.key, entry.key) {
+					oldIndex = i
+					break
+				}
+			}
+		}
+		if oldIndex >= 0 {
+			matched[oldIndex] = true
+			oldVal := oldEntries[oldIndex].value
+			if !valuesEqual(oldVal, entry.value) {
 				entryChanges = append(entryChanges, EntryChange{
-					Key:   key,
+					Key:   entry.key,
 					Type:  ChangedChangeType,
 					Left:  oldVal,
-					Right: newVal,
+					Right: entry.value,
 				})
 			}
 		} else {
 			entryChanges = append(entryChanges, EntryChange{
-				Key:   key,
+				Key:   entry.key,
 				Type:  AddedChangeType,
 				Left:  nil,
-				Right: newVal,
+				Right: entry.value,
 			})
 		}
 	}
 
-	for _, key := range sortedMapKeys(oldMap) {
-		oldVal := oldMap[key]
-		if _, exists := newMap[key]; !exists {
+	for i, entry := range oldEntries {
+		if !matched[i] {
 			entryChanges = append(entryChanges, EntryChange{
-				Key:   key,
+				Key:   entry.key,
 				Type:  RemovedChangeType,
-				Left:  oldVal,
+				Left:  entry.value,
 				Right: nil,
 			})
 		}
@@ -468,28 +510,46 @@ func (g *Govers) createMapChangeFromValues(globalID GlobalID, metadata CommitMet
 	return NewMapChange(globalID, metadata, propName, entryChanges)
 }
 
-func sortedMapKeys(values map[any]any) []any {
-	keys := make([]any, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
+type mapEntry struct {
+	key     any
+	value   any
+	sortKey string
+}
+
+func jsonMapEntryKeys(entries []mapEntry) []string {
+	indexes := make(map[any]int, len(entries))
+	for i, entry := range entries {
+		indexes[entry.key] = i
 	}
-	slices.SortFunc(keys, func(a, b any) int {
-		return strings.Compare(fmt.Sprintf("%T:%#v", a, a), fmt.Sprintf("%T:%#v", b, b))
-	})
+	data, err := json.Marshal(indexes)
+	if err != nil {
+		return nil
+	}
+	var normalized map[string]int
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		return nil
+	}
+	keys := make([]string, len(entries))
+	for key, index := range normalized {
+		keys[index] = key
+	}
 	return keys
 }
 
-func toMap(v any) map[any]any {
+func sortedMapEntries(v any) []mapEntry {
 	if v == nil {
-		return make(map[any]any)
+		return nil
 	}
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Map {
-		return make(map[any]any)
+		return nil
 	}
-	result := make(map[any]any)
-	for _, key := range rv.MapKeys() {
-		result[key.Interface()] = rv.MapIndex(key).Interface()
+	entries := make([]mapEntry, 0, rv.Len())
+	iter := rv.MapRange()
+	for iter.Next() {
+		key := iter.Key().Interface()
+		entries = append(entries, mapEntry{key: key, value: iter.Value().Interface(), sortKey: fmt.Sprintf("%T:%#v", key, key)})
 	}
-	return result
+	slices.SortFunc(entries, func(a, b mapEntry) int { return strings.Compare(a.sortKey, b.sortKey) })
+	return entries
 }

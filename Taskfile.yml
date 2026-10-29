@@ -3,7 +3,7 @@
 version: '3'
 
 vars:
-  MODULES: github.com/ralscha/govers/core/... github.com/ralscha/govers/demo/... github.com/ralscha/govers/inmemory/... github.com/ralscha/govers/mongodb/... github.com/ralscha/govers/postgres/...
+  MODULES: ./core/... ./demo/... ./inmemory/... ./mongodb/... ./postgres/...
 
 tasks:
   default:
@@ -45,11 +45,16 @@ tasks:
   format:
     desc: Format all Go files
     cmds:
-      - cmd: cd core && go fix && go fmt
-      - cmd: cd demo && go fix && go fmt
-      - cmd: cd inmemory && go fix && go fmt
-      - cmd: cd mongodb && go fix && go fmt
-      - cmd: cd postgres && go fix && go fmt
+      - go -C core fmt ./...
+      - go -C demo fmt ./...
+      - go -C inmemory fmt ./...
+      - go -C mongodb fmt ./...
+      - go -C postgres fmt ./...
+
+  fix:
+    desc: Modernize Go code with go fix
+    cmds:
+      - "go fix {{.MODULES}}"
 
   tidy:
     desc: Tidy all module dependencies
@@ -82,7 +87,10 @@ tasks:
 
   check:
     desc: Run all checks (format, vet, test)
-    deps: [format, vet, test]
+    cmds:
+      - task: format
+      - task: vet
+      - task: test
 
   lint:
     desc: Run golangci-lint in Docker

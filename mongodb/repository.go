@@ -9,7 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
+	"strings"
 	"time"
 
 	"github.com/ralscha/govers/core"
@@ -30,6 +30,7 @@ const (
 	fieldGlobalIDOwnerIDEntity = "globalId.ownerId.entity"
 	fieldGlobalIDOwnerIDCdoID  = "globalId.ownerId.cdoId"
 	fieldVersion               = "version"
+	fieldSnapshotType          = "type"
 	fieldChangedProperties     = "changedProperties"
 	fieldCommitID              = "commitMetadata.id"
 	fieldCommitAuthor          = "commitMetadata.author"
@@ -42,7 +43,7 @@ type GlobalIDDocument struct {
 	// For InstanceId: entity contains the type name
 	Entity string `bson:"entity,omitempty"`
 	// For InstanceId: cdoId contains the local id
-	CdoID any `bson:"cdoId,omitempty"`
+	CdoID any `bson:"cdoId"`
 	// For ValueObjectId: valueObject contains the type name
 	ValueObject string `bson:"valueObject,omitempty"`
 	// For ValueObjectId: ownerId contains the owner's InstanceId info
@@ -229,6 +230,32 @@ func (r *Repository) GetHeadID(ctx context.Context) (core.CommitID, error) {
 
 // Persist saves a commit and its snapshots to the repository.
 func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
+	// Marshal the entire batch before writing, so an unsupported value cannot
+	// leave an earlier snapshot behind. Allocate IDs locally for safe cleanup
+	// even when a partial insert does not return its generated IDs.
+	documents := make([]any, 0, len(commit.Snapshots))
+	insertedIDs := make([]any, 0, len(commit.Snapshots))
+	for _, snapshot := range commit.Snapshots {
+		if snapshot.GlobalID == nil {
+			return fmt.Errorf("snapshot has a nil global ID")
+		}
+		snapshotDocument, err := r.snapshotToDocument(snapshot)
+		if err != nil {
+			return fmt.Errorf("failed to marshal snapshot: %w", err)
+		}
+		id := bson.NewObjectID()
+		document := struct {
+			ID               bson.ObjectID `bson:"_id"`
+			SnapshotDocument `bson:",inline"`
+		}{ID: id, SnapshotDocument: snapshotDocument}
+		encoded, err := bson.Marshal(document)
+		if err != nil {
+			return fmt.Errorf("failed to marshal snapshot: %w", err)
+		}
+		documents = append(documents, bson.Raw(encoded))
+		insertedIDs = append(insertedIDs, id)
+	}
+
 	if err := r.ensureCanonicalHead(ctx); err != nil {
 		return err
 	}
@@ -241,10 +268,8 @@ func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
 		return fmt.Errorf("%w: expected commit ID %s, got %s", core.ErrConcurrentCommit, expectedID, commit.Metadata.ID)
 	}
 
-	insertedIDs := make([]any, 0, len(commit.Snapshots))
-	for _, snapshot := range commit.Snapshots {
-		doc := r.snapshotToDocument(snapshot)
-		result, err := r.snapshotsCollection().InsertOne(ctx, doc)
+	if len(documents) > 0 {
+		_, err := r.snapshotsCollection().InsertMany(ctx, documents)
 		if err != nil {
 			persistErr := fmt.Errorf("failed to insert snapshot: %w", err)
 			if mongo.IsDuplicateKeyError(err) {
@@ -252,7 +277,6 @@ func (r *Repository) Persist(ctx context.Context, commit core.Commit) error {
 			}
 			return errors.Join(persistErr, r.removeSnapshots(ctx, insertedIDs))
 		}
-		insertedIDs = append(insertedIDs, result.InsertedID)
 	}
 
 	if err := r.advanceHeadID(ctx, headID, commit.Metadata.ID); err != nil {
@@ -312,7 +336,11 @@ func (r *Repository) removeSnapshots(ctx context.Context, ids []any) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	_, err := r.snapshotsCollection().DeleteMany(ctx, bson.D{{
+	// A failed request often has an expired context. Rollback must still run,
+	// but keep it bounded if the database is unavailable.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, err := r.snapshotsCollection().DeleteMany(cleanupCtx, bson.D{{
 		Key:   "_id",
 		Value: bson.D{{Key: "$in", Value: ids}},
 	}})
@@ -322,9 +350,24 @@ func (r *Repository) removeSnapshots(ctx context.Context, ids []any) error {
 	return nil
 }
 
-func (r *Repository) snapshotToDocument(snapshot core.Snapshot) SnapshotDocument {
+func (r *Repository) snapshotToDocument(snapshot core.Snapshot) (SnapshotDocument, error) {
+	globalID, err := normalizeGlobalID(snapshot.GlobalID)
+	if err != nil {
+		return SnapshotDocument{}, err
+	}
+	snapshot.GlobalID = globalID
+	// Use the same representation as the JSON repository. In particular BSON
+	// otherwise lowercases nested struct fields and truncates time nanoseconds.
+	encodedState, err := snapshot.State.MarshalJSON()
+	if err != nil {
+		return SnapshotDocument{}, err
+	}
+	var normalizedState core.SnapshotState
+	if err := normalizedState.UnmarshalJSON(encodedState); err != nil {
+		return SnapshotDocument{}, err
+	}
 	properties := make(bson.M)
-	snapshot.State.ForEachProperty(func(name string, value any) {
+	normalizedState.ForEachProperty(func(name string, value any) {
 		properties[name] = value
 	})
 
@@ -370,15 +413,16 @@ func (r *Repository) snapshotToDocument(snapshot core.Snapshot) SnapshotDocument
 		}
 	}
 
-	return doc
+	return doc, nil
 }
 
 func (r *Repository) documentToSnapshot(doc SnapshotDocument) (core.Snapshot, error) {
 	var globalID core.GlobalID
 	if doc.GlobalID.Entity != "" {
-		globalID = core.NewInstanceID(doc.GlobalID.Entity, doc.GlobalID.CdoID)
+		globalID = restoreInstanceID(doc.GlobalID.Entity, doc.GlobalID.CdoID, doc.GlobalIDKey)
 	} else if doc.GlobalID.ValueObject != "" && doc.GlobalID.OwnerID != nil {
-		ownerID := core.NewInstanceID(doc.GlobalID.OwnerID.Entity, doc.GlobalID.OwnerID.CdoID)
+		ownerKey := strings.TrimSuffix(doc.GlobalIDKey, "#"+doc.GlobalID.Fragment)
+		ownerID := restoreInstanceID(doc.GlobalID.OwnerID.Entity, doc.GlobalID.OwnerID.CdoID, ownerKey)
 		globalID = core.NewValueObjectID(doc.GlobalID.ValueObject, ownerID, doc.GlobalID.Fragment)
 	}
 	if globalID == nil {
@@ -394,7 +438,9 @@ func (r *Repository) documentToSnapshot(doc SnapshotDocument) (core.Snapshot, er
 	var snapshotState core.SnapshotState
 	if len(doc.State.Properties) > 0 {
 		properties := make(map[string]any, len(doc.State.Properties))
-		maps.Copy(properties, doc.State.Properties)
+		for name, value := range doc.State.Properties {
+			properties[name] = normalizeBSONValue(value)
+		}
 		snapshotState = core.NewSnapshotStateWithMetadata(properties, doc.State.IgnoreOrderProperties, doc.State.EntityProperties)
 	} else {
 		snapshotState = core.EmptySnapshotState()
@@ -420,14 +466,62 @@ func (r *Repository) documentToSnapshot(doc SnapshotDocument) (core.Snapshot, er
 	}, nil
 }
 
+func restoreInstanceID(typeName string, localID any, key string) core.InstanceID {
+	id := core.NewInstanceID(typeName, normalizeBSONValue(localID))
+	// BSON can change the type and formatting of IDs (for example byte slices
+	// become bson.Binary). The stored key preserves the original identity.
+	if key != "" && id.Value() != key {
+		if stableLocalID, ok := strings.CutPrefix(key, typeName+"/"); ok {
+			return core.NewInstanceID(typeName, stableLocalID)
+		}
+	}
+	return id
+}
+
+// BSON's default interface decoder represents nested documents as ordered
+// slices. Restore maps so persisted state compares with domain map values.
+func normalizeBSONValue(value any) any {
+	switch value := value.(type) {
+	case bson.D:
+		result := make(map[string]any, len(value))
+		for _, entry := range value {
+			result[entry.Key] = normalizeBSONValue(entry.Value)
+		}
+		return result
+	case bson.M:
+		result := make(map[string]any, len(value))
+		for key, entry := range value {
+			result[key] = normalizeBSONValue(entry)
+		}
+		return result
+	case bson.A:
+		result := make([]any, len(value))
+		for index, entry := range value {
+			result[index] = normalizeBSONValue(entry)
+		}
+		return result
+	case bson.Binary:
+		if value.Subtype == 0 {
+			return value.Data
+		}
+	case bson.DateTime:
+		return value.Time()
+	}
+	return value
+}
+
 // GetLatestSnapshot returns the most recent snapshot for the given GlobalID.
 // Returns nil if no snapshot exists for this GlobalID.
 func (r *Repository) GetLatestSnapshot(ctx context.Context, globalID core.GlobalID) (*core.Snapshot, error) {
+	globalID, err := normalizeGlobalID(globalID)
+	if err != nil {
+		return nil, err
+	}
 	filter := bson.D{{Key: fieldGlobalIDKey, Value: globalID.Value()}}
 	opts := options.FindOne().SetSort(bson.D{{Key: fieldVersion, Value: -1}})
 
 	var doc SnapshotDocument
-	err := r.snapshotsCollection().FindOne(ctx, filter, opts).Decode(&doc)
+	err = r.snapshotsCollection().FindOne(ctx, filter, opts).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil, nil
 	}
@@ -449,19 +543,8 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 		return nil, err
 	}
 
-	opts := options.Find().SetSort(bson.D{
-		{Key: fieldCommitDate, Value: -1},
-		{Key: fieldVersion, Value: -1},
-	})
-
-	if query.Limit > 0 {
-		opts.SetLimit(int64(query.Limit))
-	}
-	if query.Skip > 0 {
-		opts.SetSkip(int64(query.Skip))
-	}
-
-	cursor, err := r.snapshotsCollection().Find(ctx, filter, opts)
+	cursor, err := r.snapshotsCollection().Aggregate(ctx, snapshotPipeline(filter, query),
+		options.Aggregate().SetCollation(&options.Collation{Locale: "simple"}))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query snapshots: %w", err)
 	}
@@ -485,6 +568,38 @@ func (r *Repository) GetSnapshots(ctx context.Context, query core.Query) ([]core
 	}
 
 	return snapshots, nil
+}
+
+func snapshotPipeline(filter bson.D, query core.Query) mongo.Pipeline {
+	commitPart := func(index int) bson.D {
+		return bson.D{{Key: "$toLong", Value: bson.D{{Key: "$arrayElemAt", Value: bson.A{
+			bson.D{{Key: "$split", Value: bson.A{"$" + fieldCommitID, "."}}}, index,
+		}}}}}
+	}
+	// Commit IDs are stored as strings. Sort their components numerically so
+	// commits 10.0 and 9.0 remain correctly ordered when BSON dates tie.
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: filter}},
+		{{Key: "$set", Value: bson.D{
+			{Key: "_commitMajor", Value: commitPart(0)},
+			{Key: "_commitMinor", Value: commitPart(1)},
+		}}},
+		{{Key: "$sort", Value: bson.D{
+			{Key: fieldCommitDate, Value: -1},
+			{Key: "_commitMajor", Value: -1},
+			{Key: "_commitMinor", Value: -1},
+			{Key: fieldVersion, Value: -1},
+			{Key: fieldGlobalIDKey, Value: 1},
+			{Key: "_id", Value: 1},
+		}}},
+	}
+	if query.Skip > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$skip", Value: int64(query.Skip)}})
+	}
+	if query.Limit > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$limit", Value: int64(query.Limit)}})
+	}
+	return pipeline
 }
 
 func snapshotFilter(query core.Query) (bson.D, error) {
@@ -512,6 +627,9 @@ func snapshotFilter(query core.Query) (bson.D, error) {
 
 	if query.Version > 0 {
 		filter = append(filter, bson.E{Key: fieldVersion, Value: query.Version})
+	}
+	if query.SnapshotType != "" {
+		filter = append(filter, bson.E{Key: fieldSnapshotType, Value: string(query.SnapshotType)})
 	}
 
 	if query.Author != "" {
@@ -546,13 +664,17 @@ func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, ve
 	if version <= 0 {
 		return nil, core.ErrInvalidVersion
 	}
+	globalID, err := normalizeGlobalID(globalID)
+	if err != nil {
+		return nil, err
+	}
 	filter := bson.D{
 		{Key: fieldGlobalIDKey, Value: globalID.Value()},
 		{Key: fieldVersion, Value: version},
 	}
 
 	var doc SnapshotDocument
-	err := r.snapshotsCollection().FindOne(ctx, filter).Decode(&doc)
+	err = r.snapshotsCollection().FindOne(ctx, filter).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil, nil
 	}
@@ -565,6 +687,22 @@ func (r *Repository) GetSnapshot(ctx context.Context, globalID core.GlobalID, ve
 		return nil, err
 	}
 	return &snapshot, nil
+}
+
+func normalizeGlobalID(globalID core.GlobalID) (core.GlobalID, error) {
+	switch id := globalID.(type) {
+	case core.InstanceID, core.ValueObjectID:
+		return globalID, nil
+	case *core.InstanceID:
+		if id != nil {
+			return *id, nil
+		}
+	case *core.ValueObjectID:
+		if id != nil {
+			return *id, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid GlobalID: %T", globalID)
 }
 
 // Clear removes all data from the repository. Useful for testing.
