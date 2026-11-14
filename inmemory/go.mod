@@ -1,6 +1,6 @@
 module github.com/ralscha/govers/inmemory
 
-go 1.27.3
+go 1.27.4
 
 require github.com/ralscha/govers/core v0.0.0
 
